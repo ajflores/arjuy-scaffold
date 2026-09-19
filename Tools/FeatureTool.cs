@@ -1,0 +1,223 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Text;
+using ArjuyScaffold.Models;
+using ModelContextProtocol.Server;
+
+namespace ArjuyScaffold.Tools;
+
+/// <summary>
+/// Composite tool that orchestrates the 6 individual generators (Entity, Repository, Service,
+/// EF Configuration, DTOs, Mapper) for a single entity in one call, reusing the exact same static
+/// generation methods the individual tools expose — no logic is duplicated. Returns every
+/// generated file concatenated into one annotated string, and optionally writes each one to disk
+/// under the standard 5-layer folder convention when 'outputDirectoryPath' is provided.
+///
+/// Deliberately NOT automated by this tool (documented as pending manual steps in the returned
+/// result, matching the "stub/pending" style already used by generate_di_registration):
+///   1. Adding the new DbSet&lt;{Entity}&gt; to AppDbContext.
+///   2. Registering the mapper (AutoMapper needs one AddAutoMapper(_ => { }, typeof(AnyProfile))
+///      marker call per ASSEMBLY, not per entity; Mapperly needs no DI registration at all).
+///   3. A CRUD controller — out of scope for this iteration.
+/// </summary>
+[McpServerToolType]
+public static class FeatureTool
+{
+    [McpServerTool(Name = "generate_feature")]
+    [Description(
+        "Composite tool: generates a full vertical slice for one entity in a single call — " +
+        "Entity, Repository (I{Entity}Repository/{Entity}Repository), Service " +
+        "(I{Entity}Service/{Entity}Service), EF Core configuration " +
+        "(IEntityTypeConfiguration<{Entity}>), DTOs ({Entity}ResponseModel/{Entity}RequestModel) " +
+        "and the mapper for the chosen 'mapperProvider' ('mapperly' or 'automapper', REQUIRED, no " +
+        "default — same conscious licensing choice as generate_mapper). Internally calls the same " +
+        "static generation methods used by generate_entity/generate_repository/generate_service/" +
+        "generate_ef_configuration/generate_dto/generate_mapper — nothing is reimplemented. Returns " +
+        "all generated files concatenated into one annotated string; when 'outputDirectoryPath' is " +
+        "provided, ALSO writes each file to disk under the standard 5-layer folder layout (opt-in, " +
+        "disabled by default, same pattern as generate_entity's 'outputFilePath'). Does NOT " +
+        "generate a CRUD controller, does NOT touch AppDbContext (no DbSet is added), and does NOT " +
+        "register the mapper in DI — these 3 steps are listed as pending manual work in the " +
+        "returned result.")]
+    public static string GenerateFeature(
+        [Description("Entity name in PascalCase, e.g. 'Category'.")] string entityName,
+        [Description("Properties shared across Entity, DTOs and EF configuration (name, type, plus EF-only IsRequired/MaxLength). Do NOT include Id, CreatedAt, UpdatedAt or Deleted — those are inherited from the base entity.")] List<FeaturePropertyDefinition> properties,
+        [Description("REQUIRED, no default: 'mapperly' or 'automapper'. See generate_mapper for the full rationale — this is a licensing decision, not a technical default.")] string mapperProvider,
+        [Description("Custom repository methods beyond the inherited CRUD. Omit or pass an empty list for none.")] List<RepositoryMethodDefinition>? repositoryCustomMethods = null,
+        [Description("Service methods to generate (each returns MResult<T>). Omit or pass an empty list for none.")] List<MethodDefinition>? serviceMethods = null,
+        [Description("Optional EF Core relationships to configure (HasMany/HasOne + WithOne/WithMany + optional HasForeignKey + OnDelete). Omit or pass an empty list for an entity with no navigation properties.")] List<EfRelationDefinition>? efRelations = null,
+        [Description("When true, the EF configuration OMITS HasQueryFilter(x => !x.Deleted) — use for lookup/catalog entities. Defaults to false.")] bool isLookup = false,
+        [Description("Mapperly only: module name for the generated {Module}Mapper class. Defaults to entityName when omitted. Ignored for provider='automapper'.")] string? moduleName = null,
+        [Description("Optional root namespace (e.g. 'ArjuyTurismo') used to derive every layer's namespace automatically: {root}.Domain.Entities, {root}.Repository.Interfaces/.Repositories/.Base, {root}.Persistence.Database(.Configurations), {root}.Business.Services/.Models/.Mappers(or .Mappings). When omitted, every layer falls back to its own tool's default 'ArjuyScaffold.Generated.*' namespace.")] string? namespaceRoot = null,
+        [Description("Name of the base class entities inherit from. Defaults to 'Entity', the arjuy* Clean Architecture convention.")] string? baseEntityName = null,
+        [Description("DbContext type name injected into the repository constructor. Defaults to 'AppDbContext'.")] string? dbContextTypeName = null,
+        [Description("Name of the generic base repository interface. Defaults to 'IBaseRepository'.")] string? baseRepositoryInterfaceName = null,
+        [Description("Name of the generic base repository class. Defaults to 'BaseRepository'.")] string? baseRepositoryClassName = null,
+        [Description("Mapperly only: true when the entity -> ResponseModel mapping has derived/computed fields (not a flat 1:1 copy), generating an explicit method instead of 'partial'. Defaults to false. Ignored for provider='automapper'.")] bool hasDerivedResponseFields = false,
+        [Description("Optional absolute path to a directory to also write every generated file to disk, under the standard 5-layer folder layout (Domain/Entities, Repository, Business/Services, Persistence.Database/Configurations, Business/Models, Business/Mappers or Business/Mappings). Opt-in, disabled by default — when omitted, no files are written and only the combined string is returned.")] string? outputDirectoryPath = null)
+    {
+        if (string.IsNullOrWhiteSpace(entityName))
+        {
+            throw new ArgumentException("entityName is required.", nameof(entityName));
+        }
+
+        if (string.IsNullOrWhiteSpace(mapperProvider))
+        {
+            throw new ArgumentException("mapperProvider is required and has no default — pass 'mapperly' or 'automapper' explicitly.", nameof(mapperProvider));
+        }
+
+        string normalizedProvider = mapperProvider.Trim().ToLowerInvariant();
+        if (normalizedProvider != "mapperly" && normalizedProvider != "automapper")
+        {
+            throw new ArgumentException("mapperProvider must be either 'mapperly' or 'automapper'.", nameof(mapperProvider));
+        }
+
+        List<FeaturePropertyDefinition> resolvedProperties = properties ?? new List<FeaturePropertyDefinition>();
+        string resolvedModuleName = string.IsNullOrWhiteSpace(moduleName) ? entityName : moduleName;
+
+        string? entityNamespace = null;
+        string? repositoryInterfaceNamespace = null;
+        string? repositoryImplementationNamespace = null;
+        string? repositoryBaseNamespace = null;
+        string? dbContextNamespace = null;
+        string? serviceNamespace = null;
+        string? dtoNamespace = null;
+        string? mapperNamespace = null;
+        string? efConfigurationNamespace = null;
+
+        if (!string.IsNullOrWhiteSpace(namespaceRoot))
+        {
+            entityNamespace = namespaceRoot + ".Domain.Entities";
+            repositoryInterfaceNamespace = namespaceRoot + ".Repository.Interfaces";
+            repositoryImplementationNamespace = namespaceRoot + ".Repository.Repositories";
+            repositoryBaseNamespace = namespaceRoot + ".Repository.Base";
+            dbContextNamespace = namespaceRoot + ".Persistence.Database";
+            serviceNamespace = namespaceRoot + ".Business.Services";
+            dtoNamespace = namespaceRoot + ".Business.Models";
+            mapperNamespace = normalizedProvider == "mapperly" ? namespaceRoot + ".Business.Mappers" : namespaceRoot + ".Business.Mappings";
+            efConfigurationNamespace = namespaceRoot + ".Persistence.Database.Configurations";
+        }
+
+        List<PropertyDefinition> plainProperties = resolvedProperties
+            .Select(property => new PropertyDefinition { Name = property.Name, Type = property.Type })
+            .ToList();
+
+        List<EfPropertyDefinition> efProperties = resolvedProperties
+            .Select(property => new EfPropertyDefinition { Name = property.Name, IsRequired = property.IsRequired, MaxLength = property.MaxLength })
+            .ToList();
+
+        string entitySource = EntityTool.GenerateEntity(
+            entityName: entityName,
+            properties: plainProperties,
+            namespaceName: entityNamespace,
+            baseEntityName: baseEntityName,
+            outputFilePath: null);
+
+        string repositorySource = RepositoryTool.GenerateRepository(
+            entityName: entityName,
+            customMethods: repositoryCustomMethods,
+            entityNamespace: entityNamespace,
+            interfaceNamespace: repositoryInterfaceNamespace,
+            implementationNamespace: repositoryImplementationNamespace,
+            baseNamespace: repositoryBaseNamespace,
+            dbContextNamespace: dbContextNamespace,
+            dbContextTypeName: dbContextTypeName,
+            baseRepositoryInterfaceName: baseRepositoryInterfaceName,
+            baseRepositoryClassName: baseRepositoryClassName);
+
+        string serviceSource = ServiceTool.GenerateService(
+            serviceName: entityName,
+            methods: serviceMethods ?? new List<MethodDefinition>(),
+            namespaceName: serviceNamespace);
+
+        string efConfigurationSource = EfConfigurationTool.GenerateEfConfiguration(
+            entityName: entityName,
+            properties: efProperties,
+            relations: efRelations,
+            isLookup: isLookup,
+            tableName: null,
+            namespaceName: efConfigurationNamespace,
+            entityNamespace: entityNamespace);
+
+        string dtoSource = DtoTool.GenerateDto(
+            entityName: entityName,
+            properties: plainProperties,
+            namespaceName: dtoNamespace);
+
+        string mapperSource = MapperTool.GenerateMapper(
+            provider: normalizedProvider,
+            entityName: entityName,
+            moduleName: moduleName,
+            hasDerivedResponseFields: hasDerivedResponseFields,
+            namespaceName: mapperNamespace,
+            entityNamespace: entityNamespace,
+            dtoNamespace: dtoNamespace);
+
+        StringBuilder resultBuilder = new StringBuilder();
+        resultBuilder.AppendLine("// ===== generate_feature: " + entityName + " (mapperProvider=" + normalizedProvider + ") =====");
+        resultBuilder.AppendLine("// Generated 6 files: Entity, Repository (interface+impl), Service (interface+impl),");
+        resultBuilder.AppendLine("// EF Configuration, DTOs (Response/Request), Mapper (" + normalizedProvider + ").");
+        resultBuilder.AppendLine("//");
+        resultBuilder.AppendLine("// PENDING MANUAL STEPS (NOT automated by this tool):");
+        resultBuilder.AppendLine("//   1. Add 'public DbSet<" + entityName + "> " + entityName + "s { get; set; }' to AppDbContext.");
+
+        if (normalizedProvider == "mapperly")
+        {
+            resultBuilder.AppendLine("//   2. Mapperly needs NO DI registration (compile-time source generator) — nothing to do here.");
+        }
+        else
+        {
+            resultBuilder.AppendLine("//   2. Ensure AddAutoMapper(_ => { }, typeof(AnyProfileInThisAssembly)) already runs for this");
+            resultBuilder.AppendLine("//      assembly (see the generated mapper file's trailing comment) — a ONE-TIME step per");
+            resultBuilder.AppendLine("//      assembly, not per entity.");
+        }
+
+        resultBuilder.AppendLine("//   3. No CRUD controller is generated yet — out of scope for this iteration.");
+        resultBuilder.AppendLine();
+
+        AppendSection(resultBuilder, "Entity", entitySource);
+        AppendSection(resultBuilder, "Repository", repositorySource);
+        AppendSection(resultBuilder, "Service", serviceSource);
+        AppendSection(resultBuilder, "EF Configuration", efConfigurationSource);
+        AppendSection(resultBuilder, "DTOs", dtoSource);
+        AppendSection(resultBuilder, "Mapper (" + normalizedProvider + ")", mapperSource);
+
+        if (!string.IsNullOrWhiteSpace(outputDirectoryPath))
+        {
+            WriteFile(outputDirectoryPath, Path.Combine("Domain", "Entities", entityName + ".cs"), entitySource);
+            WriteFile(outputDirectoryPath, Path.Combine("Repository", entityName + "Repository.cs"), repositorySource);
+            WriteFile(outputDirectoryPath, Path.Combine("Business", "Services", entityName + "Service.cs"), serviceSource);
+            WriteFile(outputDirectoryPath, Path.Combine("Persistence.Database", "Configurations", entityName + "Configuration.cs"), efConfigurationSource);
+            WriteFile(outputDirectoryPath, Path.Combine("Business", "Models", entityName + "Models.cs"), dtoSource);
+
+            string mapperFileName = normalizedProvider == "mapperly"
+                ? Path.Combine("Business", "Mappers", resolvedModuleName + "Mapper.cs")
+                : Path.Combine("Business", "Mappings", entityName + "Profile.cs");
+            WriteFile(outputDirectoryPath, mapperFileName, mapperSource);
+        }
+
+        return resultBuilder.ToString();
+    }
+
+    private static void AppendSection(StringBuilder resultBuilder, string title, string content)
+    {
+        resultBuilder.AppendLine("// ----- " + title + " -----");
+        resultBuilder.AppendLine(content);
+    }
+
+    private static void WriteFile(string rootDirectory, string relativePath, string content)
+    {
+        string fullPath = Path.Combine(rootDirectory, relativePath);
+        string? directory = Path.GetDirectoryName(fullPath);
+
+        if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        File.WriteAllText(fullPath, content);
+    }
+}
