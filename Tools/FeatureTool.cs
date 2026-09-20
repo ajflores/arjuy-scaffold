@@ -29,8 +29,9 @@ public static class FeatureTool
     [McpServerTool(Name = "generate_feature")]
     [Description(
         "Composite tool: generates a full vertical slice for one entity in a single call — " +
-        "Entity, Repository (I{Entity}Repository/{Entity}Repository), Service " +
-        "(I{Entity}Service/{Entity}Service), EF Core configuration " +
+        "Entity, Repository (I{Entity}Repository/{Entity}Repository), Service (I{Entity}Service " +
+        "interface + {Entity}Service class inheriting BaseService<TEntity, TResponseModel> — " +
+        "verified real convention, interface and class in SEPARATE files), EF Core configuration " +
         "(IEntityTypeConfiguration<{Entity}>), DTOs ({Entity}ResponseModel/{Entity}RequestModel) " +
         "and the mapper for the chosen 'mapperProvider' ('mapperly' or 'automapper', REQUIRED, no " +
         "default — same conscious licensing choice as generate_mapper). Internally calls the same " +
@@ -57,7 +58,7 @@ public static class FeatureTool
         [Description("Name of the generic base repository interface. Defaults to 'IBaseRepository'.")] string? baseRepositoryInterfaceName = null,
         [Description("Name of the generic base repository class. Defaults to 'BaseRepository'.")] string? baseRepositoryClassName = null,
         [Description("Mapperly only: true when the entity -> ResponseModel mapping has derived/computed fields (not a flat 1:1 copy), generating an explicit method instead of 'partial'. Defaults to false. Ignored for provider='automapper'.")] bool hasDerivedResponseFields = false,
-        [Description("Optional absolute path to a directory to also write every generated file to disk, under the standard 5-layer folder layout (Domain/Entities, Repository, Business/Services, Persistence.Database/Configurations, Business/Models, Business/Mappers or Business/Mappings). Opt-in, disabled by default — when omitted, no files are written and only the combined string is returned.")] string? outputDirectoryPath = null)
+        [Description("Optional absolute path to the SOLUTION root directory. When provided, also writes every generated file to disk under separate PROJECT folders (not a single project's subfolders) matching real Clean Architecture: {namespaceRoot}.Domain/Entities, {namespaceRoot}.Repository, {namespaceRoot}.Business/Services, {namespaceRoot}.Persistence.Database/Configurations, {namespaceRoot}.Business/Models, {namespaceRoot}.Business/Mappers or /Mappings. Domain, Repository and Persistence.Database are separate projects; Business is a single project holding Services/Models/Mappers as subfolders. If 'namespaceRoot' is omitted, the prefix falls back to 'Generated'. Opt-in, disabled by default — when omitted, no files are written and only the combined string is returned.")] string? outputDirectoryPath = null)
     {
         if (string.IsNullOrWhiteSpace(entityName))
         {
@@ -83,7 +84,9 @@ public static class FeatureTool
         string? repositoryImplementationNamespace = null;
         string? repositoryBaseNamespace = null;
         string? dbContextNamespace = null;
-        string? serviceNamespace = null;
+        string? serviceInterfaceNamespace = null;
+        string? serviceClassNamespace = null;
+        string? serviceBaseNamespace = null;
         string? dtoNamespace = null;
         string? mapperNamespace = null;
         string? efConfigurationNamespace = null;
@@ -95,7 +98,9 @@ public static class FeatureTool
             repositoryImplementationNamespace = namespaceRoot + ".Repository.Repositories";
             repositoryBaseNamespace = namespaceRoot + ".Repository.Base";
             dbContextNamespace = namespaceRoot + ".Persistence.Database";
-            serviceNamespace = namespaceRoot + ".Business.Services";
+            serviceInterfaceNamespace = namespaceRoot + ".Business.Interfaces";
+            serviceClassNamespace = namespaceRoot + ".Business.Services";
+            serviceBaseNamespace = namespaceRoot + ".Business.Base";
             dtoNamespace = namespaceRoot + ".Business.Models";
             mapperNamespace = normalizedProvider == "mapperly" ? namespaceRoot + ".Business.Mappers" : namespaceRoot + ".Business.Mappings";
             efConfigurationNamespace = namespaceRoot + ".Persistence.Database.Configurations";
@@ -128,10 +133,32 @@ public static class FeatureTool
             baseRepositoryInterfaceName: baseRepositoryInterfaceName,
             baseRepositoryClassName: baseRepositoryClassName);
 
-        string serviceSource = ServiceTool.GenerateService(
-            serviceName: entityName,
-            methods: serviceMethods ?? new List<MethodDefinition>(),
-            namespaceName: serviceNamespace);
+        List<MethodDefinition> resolvedServiceMethods = serviceMethods ?? new List<MethodDefinition>();
+
+        string serviceInterfaceSource = ServiceTool.BuildInterfaceSource(
+            entityName: entityName,
+            customMethods: resolvedServiceMethods,
+            responseModelName: null,
+            interfaceNamespace: serviceInterfaceNamespace,
+            dtoNamespace: dtoNamespace,
+            domainCommonNamespace: null);
+
+        string serviceClassSource = ServiceTool.BuildClassSource(
+            entityName: entityName,
+            customMethods: resolvedServiceMethods,
+            normalizedMapperProvider: normalizedProvider,
+            moduleName: moduleName,
+            responseModelName: null,
+            repositoryInterfaceName: null,
+            baseServiceClassName: null,
+            entityNamespace: entityNamespace,
+            interfaceNamespace: serviceInterfaceNamespace,
+            classNamespace: serviceClassNamespace,
+            repositoryNamespace: repositoryInterfaceNamespace,
+            dtoNamespace: dtoNamespace,
+            mapperNamespace: mapperNamespace,
+            baseNamespace: serviceBaseNamespace,
+            domainCommonNamespace: null);
 
         string efConfigurationSource = EfConfigurationTool.GenerateEfConfiguration(
             entityName: entityName,
@@ -158,8 +185,9 @@ public static class FeatureTool
 
         StringBuilder resultBuilder = new StringBuilder();
         resultBuilder.AppendLine("// ===== generate_feature: " + entityName + " (mapperProvider=" + normalizedProvider + ") =====");
-        resultBuilder.AppendLine("// Generated 6 files: Entity, Repository (interface+impl), Service (interface+impl),");
-        resultBuilder.AppendLine("// EF Configuration, DTOs (Response/Request), Mapper (" + normalizedProvider + ").");
+        resultBuilder.AppendLine("// Generated 7 files: Entity, Repository (interface+impl), Service Interface, Service Class");
+        resultBuilder.AppendLine("// (inherits BaseService<TEntity, TResponseModel>), EF Configuration, DTOs (Response/Request),");
+        resultBuilder.AppendLine("// Mapper (" + normalizedProvider + ").");
         resultBuilder.AppendLine("//");
         resultBuilder.AppendLine("// PENDING MANUAL STEPS (NOT automated by this tool):");
         resultBuilder.AppendLine("//   1. Add 'public DbSet<" + entityName + "> " + entityName + "s { get; set; }' to AppDbContext.");
@@ -180,22 +208,26 @@ public static class FeatureTool
 
         AppendSection(resultBuilder, "Entity", entitySource);
         AppendSection(resultBuilder, "Repository", repositorySource);
-        AppendSection(resultBuilder, "Service", serviceSource);
+        AppendSection(resultBuilder, "Service Interface", serviceInterfaceSource);
+        AppendSection(resultBuilder, "Service Class", serviceClassSource);
         AppendSection(resultBuilder, "EF Configuration", efConfigurationSource);
         AppendSection(resultBuilder, "DTOs", dtoSource);
         AppendSection(resultBuilder, "Mapper (" + normalizedProvider + ")", mapperSource);
 
         if (!string.IsNullOrWhiteSpace(outputDirectoryPath))
         {
-            WriteFile(outputDirectoryPath, Path.Combine("Domain", "Entities", entityName + ".cs"), entitySource);
-            WriteFile(outputDirectoryPath, Path.Combine("Repository", entityName + "Repository.cs"), repositorySource);
-            WriteFile(outputDirectoryPath, Path.Combine("Business", "Services", entityName + "Service.cs"), serviceSource);
-            WriteFile(outputDirectoryPath, Path.Combine("Persistence.Database", "Configurations", entityName + "Configuration.cs"), efConfigurationSource);
-            WriteFile(outputDirectoryPath, Path.Combine("Business", "Models", entityName + "Models.cs"), dtoSource);
+            string projectPrefix = string.IsNullOrWhiteSpace(namespaceRoot) ? "Generated" : namespaceRoot;
+
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Domain", "Entities", entityName + ".cs"), entitySource);
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Repository", entityName + "Repository.cs"), repositorySource);
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Interfaces", "I" + entityName + "Service.cs"), serviceInterfaceSource);
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Services", entityName + "Service.cs"), serviceClassSource);
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Persistence.Database", "Configurations", entityName + "Configuration.cs"), efConfigurationSource);
+            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Models", entityName + "Models.cs"), dtoSource);
 
             string mapperFileName = normalizedProvider == "mapperly"
-                ? Path.Combine("Business", "Mappers", resolvedModuleName + "Mapper.cs")
-                : Path.Combine("Business", "Mappings", entityName + "Profile.cs");
+                ? Path.Combine(projectPrefix + ".Business", "Mappers", resolvedModuleName + "Mapper.cs")
+                : Path.Combine(projectPrefix + ".Business", "Mappings", entityName + "Profile.cs");
             WriteFile(outputDirectoryPath, mapperFileName, mapperSource);
         }
 

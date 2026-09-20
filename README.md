@@ -20,7 +20,7 @@ escribirlo a disco.
 | Tool | Qué genera | Estado |
 |------|-----------|--------|
 | `generate_entity` | Clase de entidad Domain que hereda `Entity` (o el nombre que le pases), con propiedades auto-implementadas | Completo |
-| `generate_service` | Par `I{Name}Service` / `{Name}Service`, todo método devuelve `MResult<T>`, try/catch que convierte cualquier excepción en `MResult<T>.Fail(...)`, nunca deja escapar la excepción | Completo |
+| `generate_service` | `I{Entity}Service` / `{Entity}Service` en **archivos separados** (`Business/Interfaces/` y `Business/Services/`), la clase hereda `BaseService<TEntity, TResponseModel>` (verificado contra `ArjuyTurismo.Business`) e implementa solo `MapToResponse` + métodos custom — NO reimplementa `GetByIdAsync`/`GetAllAsync`/`DeleteAsync`, esos ya los da la base. Todo método (custom) devuelve `Task<MResult<T>>`, try/catch → `MResult<T>.Fail(...)` | Completo — ver sección dedicada abajo |
 | `generate_repository` | Par `I{Name}Repository` / `{Name}Repository`, ambos extienden el genérico `IBaseRepository<T>`/`BaseRepository<T>` (CRUD heredado: `GetByIdAsync`, `GetAllAsync`, `CreateAsync`, `UpdateAsync`, `DeleteAsync`, `ExistsAsync`), constructor solo reenvía el DbContext a `base(context)`, métodos custom opcionales como `Task`/`Task<T>` planos (sin `MResult<T>`, sin try/catch) | Completo |
 | `generate_ef_configuration` | `Persistence.Database/Configurations/{Entity}Configuration.cs`, `IEntityTypeConfiguration<T>` con `ToTable`, `HasKey`, `HasQueryFilter(soft delete)` (omitido si `isLookup=true`), `Property(...)` por campo y relaciones `HasMany/HasOne` + `WithOne/WithMany` + `HasForeignKey` + `OnDelete` | Completo |
 | `generate_dto` | `Business/Models/{Entity}Models.cs` con `{Entity}ResponseModel` y `{Entity}RequestModel`, propiedades planas, sin Data Annotations, strings con default `= string.Empty` | Completo |
@@ -28,6 +28,68 @@ escribirlo a disco.
 | `generate_feature` | Tool compuesta: orquesta `generate_entity` + `generate_repository` + `generate_service` + `generate_ef_configuration` + `generate_dto` + `generate_mapper` para UNA entidad en una sola llamada, reutilizando las mismas funciones estáticas (nada duplicado) | Completo |
 | `generate_middleware_config` | `Api/ConfigServices/{Name}Config.cs` como extension method de `IServiceCollection` (y opcionalmente de `WebApplication`) | Completo |
 | `generate_di_registration` | `DependencyInjectionConfig.cs` con `RegisterAssembly(...)` por reflexión | **Stub/incompleto** — ver abajo |
+| `generate_solution_layout` | Bibliotecas de clase REALES (`.csproj`) para Domain/Persistence.Database/Repository/Business, agregadas a un `.slnx`/`.sln` con `ProjectReference` correctos (verificado contra `arjuyTurismo/ArjuyTurismoApp`); opcionalmente wirea un proyecto Api existente | Completo — única tool que ejecuta `dotnet` CLI, ver abajo |
+
+### `generate_solution_layout` — la única tool con efectos colaterales reales
+
+Todas las demás tools solo devuelven strings (y opcionalmente escriben UN archivo/carpeta de
+archivos si se pide). Esta tool en cambio **ejecuta la CLI de `dotnet`** (`dotnet new classlib`,
+`dotnet new sln`, `dotnet sln add`, `dotnet add reference`) porque no hay forma de crear un
+proyecto de verdad escribiendo un string a disco — un `.csproj` sin estar dado de alta en la
+solución y sin sus `ProjectReference` no es una biblioteca separada, es un archivo suelto.
+
+Grafo de dependencias verificado contra el `.csproj` real de cada capa en `ArjuyTurismoApp`:
+
+```
+{namespaceRoot}.Domain                    (sin dependencias)
+{namespaceRoot}.Persistence.Database  →   Domain
+{namespaceRoot}.Repository             →   Domain, Persistence.Database
+{namespaceRoot}.Business               →   Domain, Persistence.Database, Repository
+{apiProjectPath} (si se pasa)          →   las 4 capas DIRECTAMENTE (no solo Business —
+                                            así está en ArjuyTurismo.Api.csproj real)
+```
+
+Es **idempotente**: si un proyecto ya existe lo saltea (no lo pisa) pero igual asegura que esté
+agregado a la solución y con sus referencias — se puede correr de nuevo sin romper nada.
+
+**`includeBaseInfrastructure` (default `true`)** — además siembra las clases base que
+`generate_entity`/`generate_repository`/`generate_service` YA ASUMEN que existen (verificado
+archivo por archivo contra `ArjuyTurismoApp`, no inventado):
+
+```
+{namespaceRoot}.Domain/Common/ArgentinaTime.cs
+{namespaceRoot}.Domain/Common/Entity.cs
+{namespaceRoot}.Domain/Common/MResult.cs
+{namespaceRoot}.Persistence.Database/AppDbContext.cs   (vacío, sin DbSets — se agregan a mano por entidad,
+                                                         pero YA trae modelBuilder.ApplyConfigurationsFromAssembly(...)
+                                                         en OnModelCreating, así que las EF Configurations que
+                                                         genera generate_ef_configuration no necesitan registro manual)
+{namespaceRoot}.Repository/Base/IBaseRepository.cs
+{namespaceRoot}.Repository/Base/BaseRepository.cs
+{namespaceRoot}.Business/Base/IBaseService.cs      (*)
+{namespaceRoot}.Business/Base/BaseService.cs
+```
+
+(*) `IBaseService<TEntity, TResponseModel>` **NO existe en el `ArjuyTurismoApp` real** — ese
+proyecto solo tiene `BaseService.cs` sin interface. Se agregó por pedido explícito para que
+`Business/Base` siga el mismo patrón interface+clase que `Repository/Base`, no porque se haya
+verificado contra el ejemplo. Documentado acá para que quede claro que es una convención propia,
+no una convención de `arjuy*`.
+
+También agrega `Microsoft.EntityFrameworkCore` + `Microsoft.EntityFrameworkCore.SqlServer` como
+`PackageReference` de `{namespaceRoot}.Persistence.Database` (los necesita `AppDbContext`/
+`BaseRepository`). Esos paquetes fluyen transitivamente a `Repository` y `Business` vía
+`ProjectReference` — no hace falta agregarlos de nuevo en cada proyecto (así es como `BaseService`
+usa `ILogger` sin tener su propio `PackageReference` a logging: lo hereda transitivamente de la
+cadena EF Core → Persistence.Database → Repository → Business).
+
+Cada archivo se escribe solo si **no existe todavía** (`WriteIfMissing`) — nunca pisa algo que el
+usuario ya haya editado a mano. Pasar `includeBaseInfrastructure: false` si se quiere el layout de
+proyectos sin esta siembra (por ejemplo, para armar la base infra distinto a mano).
+
+**Limitación conocida**: fuera de EF Core en Persistence.Database, no copia otros `PackageReference`
+(AutoMapper, Mapperly, MailKit, etc.) — esos quedan manuales (`dotnet add package ...`) porque son
+decisión del proyecto destino, no una convención fija.
 
 ### `generate_mapper` — por qué `provider` no tiene default
 
@@ -69,6 +131,23 @@ Ambas convenciones fueron **verificadas contra código real**, no inventadas:
   cada llamada — lo documentan como paso manual único por ensamblado en un comentario al final del
   archivo generado.
 
+### `generate_service` — asume que `BaseService<TEntity, TResponseModel>` ya existe
+
+Mismo criterio que `generate_entity` con la clase `Entity`: esta tool **no genera** `BaseService`
+(la clase base abstracta con `GetByIdAsync`/`GetAllAsync`/`DeleteAsync` + `MapToResponse` abstracto,
+verificada en `ArjuyTurismo.Business/Base/BaseService.cs`) — asume que ya existe en el proyecto
+destino. Si no existe todavía, hay que crearla a mano una sola vez antes de usar `generate_service`
+o `generate_feature`.
+
+La interface generada **declara igual** las 3 firmas heredadas (`GetAllAsync`, `GetByIdAsync`,
+`DeleteAsync`) aunque la clase no las reimplemente — en C# los métodos `public virtual` de la clase
+base satisfacen la interface de la clase derivada sin redeclararlos, exactamente como
+`ICategoryService`/`CategoryService` en el proyecto real.
+
+La clase mantiene además su **propio campo de repositorio con tipo específico**
+(`I{Entity}Repository`, no solo el `IBaseRepository<TEntity>` genérico de la base) para consultas
+custom — se lo pasa a `base(...)` también, igual que `_categoryRepository` en el ejemplo real.
+
 ### `generate_feature` — qué NO automatiza
 
 - No toca `AppDbContext` — agregar el `DbSet<{Entity}>` queda como paso manual (documentado en el
@@ -76,6 +155,28 @@ Ambas convenciones fueron **verificadas contra código real**, no inventadas:
 - No registra el mapper en DI — para AutoMapper es un paso único por ensamblado (ver arriba), para
   Mapperly no aplica (no requiere DI).
 - No genera controller CRUD — queda para una próxima iteración.
+
+### `generate_feature` — `outputDirectoryPath` escribe PROYECTOS, no carpetas de un solo proyecto
+
+`outputDirectoryPath` apunta a la carpeta **raíz de la solución** (donde vive el `.sln`), no a un
+único proyecto. Cada capa se escribe en su propia carpeta de proyecto hermana, prefijada con
+`namespaceRoot` (ej. `ArjuyTurismo`):
+
+```
+{outputDirectoryPath}/
+  {namespaceRoot}.Domain/Entities/{Entity}.cs
+  {namespaceRoot}.Repository/{Entity}Repository.cs
+  {namespaceRoot}.Persistence.Database/Configurations/{Entity}Configuration.cs
+  {namespaceRoot}.Business/Services/{Entity}Service.cs
+  {namespaceRoot}.Business/Models/{Entity}Models.cs
+  {namespaceRoot}.Business/Mappers/{Module}Mapper.cs        (provider=mapperly)
+  {namespaceRoot}.Business/Mappings/{Entity}Profile.cs      (provider=automapper)
+```
+
+`Domain`, `Repository` y `Persistence.Database` son **proyectos separados** (cada uno necesita su
+propio `.csproj`, que esta tool no genera). `Business` es **un solo proyecto** que agrupa
+`Services/`, `Models/` y `Mappers`/`Mappings` como subcarpetas internas — no capas separadas. Si
+`namespaceRoot` se omite, el prefijo cae a `Generated` (`Generated.Domain`, etc.).
 
 ## Convenciones cubiertas (de `arjuySticker/skills/backend-orchestrator`)
 
@@ -133,6 +234,10 @@ Ambas convenciones fueron **verificadas contra código real**, no inventadas:
   aceptable para un prototipo, pero a revisar antes de un uso real.
 - `generate_feature` no genera controller CRUD ni toca `AppDbContext`/registro de DI del mapper —
   ver la sección dedicada arriba.
+- `generate_feature` con `outputDirectoryPath` crea las carpetas de proyecto (`{Prefix}.Domain`,
+  `{Prefix}.Repository`, `{Prefix}.Persistence.Database`, `{Prefix}.Business`) pero **no genera los
+  `.csproj`** de cada una ni las agrega al `.sln` — eso sigue siendo paso manual
+  (`dotnet new classlib` + `dotnet sln add` + referencias entre proyectos por capa).
 
 ## Cómo compilar
 
