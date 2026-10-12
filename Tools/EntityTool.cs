@@ -35,7 +35,8 @@ public static class EntityTool
         [Description("Properties to add to the entity (name + C# type each). Do NOT include Id, CreatedAt, UpdatedAt or Deleted — those are inherited from Entity.")] List<PropertyDefinition> properties,
         [Description("Namespace for the generated class. Defaults to '{EntityName}.Domain.Entities' style if omitted.")] string? namespaceName = null,
         [Description("Name of the base class entities inherit from. Defaults to 'Entity', the arjuy* Clean Architecture convention (Domain/Common/Entity.cs). Override only if the target project genuinely uses a different name.")] string? baseEntityName = null,
-        [Description("Optional absolute path to also write the generated .cs file to disk. When omitted, no file is written and only the string is returned.")] string? outputFilePath = null)
+        [Description("Optional absolute path to also write the generated .cs file to disk. When omitted, no file is written and only the string is returned.")] string? outputFilePath = null,
+        [Description("Namespace where the base class lives, added as a using directive. Defaults to '{Root}.Domain.Common' derived from namespaceName (e.g. 'MyApp.Domain.Entities' -> 'MyApp.Domain.Common'). Pass an empty string to omit the using.")] string? baseEntityNamespace = null)
     {
         if (string.IsNullOrWhiteSpace(entityName))
         {
@@ -45,9 +46,15 @@ public static class EntityTool
         string resolvedNamespace = namespaceName ?? "ArjuyScaffold.Generated.Domain.Entities";
         string resolvedBaseEntity = string.IsNullOrWhiteSpace(baseEntityName) ? "Entity" : baseEntityName;
 
+        string? resolvedBaseNamespace = baseEntityNamespace ?? DeriveCommonNamespace(resolvedNamespace);
+
         StringBuilder sourceBuilder = new StringBuilder();
-        sourceBuilder.AppendLine("using System;");
-        sourceBuilder.AppendLine();
+        if (!string.IsNullOrWhiteSpace(resolvedBaseNamespace) && resolvedBaseNamespace != resolvedNamespace)
+        {
+            // Entity (y ArgentinaTime) viven en {Root}.Domain.Common: sin este using la entidad no compila.
+            sourceBuilder.AppendLine("using " + resolvedBaseNamespace + ";");
+            sourceBuilder.AppendLine();
+        }
         sourceBuilder.AppendLine("namespace " + resolvedNamespace + ";");
         sourceBuilder.AppendLine();
         sourceBuilder.AppendLine("public class " + entityName + " : " + resolvedBaseEntity);
@@ -59,7 +66,7 @@ public static class EntityTool
             {
                 string propertyType = string.IsNullOrWhiteSpace(property.Type) ? "string" : property.Type;
                 string propertyName = string.IsNullOrWhiteSpace(property.Name) ? "PropertyName" : property.Name;
-                sourceBuilder.AppendLine("    public " + propertyType + " " + propertyName + " { get; set; }");
+                sourceBuilder.AppendLine("    public " + propertyType + " " + propertyName + " { get; set; }" + DefaultInitializer(propertyType));
             }
         }
 
@@ -79,5 +86,47 @@ public static class EntityTool
         }
 
         return generatedSource;
+    }
+
+    /// <summary>
+    /// 'MyApp.Domain.Entities' -> 'MyApp.Domain.Common'. Returns null when the namespace has no
+    /// '.Domain' segment, because then there is no reliable convention to derive it from.
+    /// </summary>
+    private static string? DeriveCommonNamespace(string entityNamespace)
+    {
+        int domainIndex = entityNamespace.IndexOf(".Domain", StringComparison.Ordinal);
+        if (domainIndex < 0)
+        {
+            return null;
+        }
+
+        return entityNamespace.Substring(0, domainIndex) + ".Domain.Common";
+    }
+
+    /// <summary>
+    /// Initializers that keep the project warning-free under Nullable=enable: non-nullable strings
+    /// start empty and collections start as empty lists, matching the DTO convention.
+    /// </summary>
+    private static string DefaultInitializer(string propertyType)
+    {
+        string type = propertyType.Trim();
+
+        if (type == "string")
+        {
+            return " = string.Empty;";
+        }
+
+        bool isCollection = type.StartsWith("List<", StringComparison.Ordinal)
+            || type.StartsWith("ICollection<", StringComparison.Ordinal)
+            || type.StartsWith("IList<", StringComparison.Ordinal)
+            || type.StartsWith("IEnumerable<", StringComparison.Ordinal);
+
+        if (isCollection && !type.EndsWith("?", StringComparison.Ordinal))
+        {
+            string elementType = type.Substring(type.IndexOf('<') + 1).TrimEnd('>');
+            return " = new List<" + elementType + ">();";
+        }
+
+        return string.Empty;
     }
 }

@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -29,6 +30,8 @@ public static class SolutionScaffoldTool
         ["Repository"] = new[] { "Domain", "Persistence.Database" },
         ["Business"] = new[] { "Domain", "Persistence.Database", "Repository" },
     };
+
+    private static readonly Regex ValidNamespace = new Regex(@"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$", RegexOptions.Compiled);
 
     [McpServerTool(Name = "generate_solution_layout")]
     [Description(
@@ -75,6 +78,14 @@ public static class SolutionScaffoldTool
             throw new ArgumentException("namespaceRoot is required.", nameof(namespaceRoot));
         }
 
+        // Se usa como nombre de proyecto, de carpeta y de namespace: tiene que ser un identificador C# válido.
+        if (!ValidNamespace.IsMatch(namespaceRoot))
+        {
+            throw new ArgumentException(
+                "namespaceRoot must be a valid C# namespace (letters, digits, '_' and '.' separators, e.g. 'ArjuyCuna').",
+                nameof(namespaceRoot));
+        }
+
         StringBuilder log = new StringBuilder();
 
         Directory.CreateDirectory(solutionRootPath);
@@ -96,7 +107,7 @@ public static class SolutionScaffoldTool
             }
             else
             {
-                RunDotnet(log, solutionRootPath, "new classlib -n " + projectName + " -o \"" + projectDirectory + "\"");
+                RunDotnet(log, solutionRootPath, "new", "classlib", "-n", projectName, "-o", projectDirectory);
 
                 string stubFile = Path.Combine(projectDirectory, "Class1.cs");
                 if (File.Exists(stubFile))
@@ -106,12 +117,12 @@ public static class SolutionScaffoldTool
                 }
             }
 
-            RunDotnet(log, solutionRootPath, "sln \"" + solutionFilePath + "\" add \"" + csprojPath + "\"");
+            RunDotnet(log, solutionRootPath, "sln", solutionFilePath, "add", csprojPath);
 
             foreach (string dependency in LayerDependencies[layer])
             {
                 string dependencyCsprojPath = csprojPathByLayer[dependency];
-                RunDotnet(log, solutionRootPath, "add \"" + csprojPath + "\" reference \"" + dependencyCsprojPath + "\"");
+                RunDotnet(log, solutionRootPath, "add", csprojPath, "reference", dependencyCsprojPath);
             }
         }
 
@@ -123,11 +134,11 @@ public static class SolutionScaffoldTool
             }
             else
             {
-                RunDotnet(log, solutionRootPath, "sln \"" + solutionFilePath + "\" add \"" + apiProjectPath + "\"");
+                RunDotnet(log, solutionRootPath, "sln", solutionFilePath, "add", apiProjectPath);
 
                 foreach (string layer in LayerOrder)
                 {
-                    RunDotnet(log, solutionRootPath, "add \"" + apiProjectPath + "\" reference \"" + csprojPathByLayer[layer] + "\"");
+                    RunDotnet(log, solutionRootPath, "add", apiProjectPath, "reference", csprojPathByLayer[layer]);
                 }
             }
         }
@@ -156,8 +167,8 @@ public static class SolutionScaffoldTool
         WriteIfMissing(log, Path.Combine(businessDirectory, "Base", "IBaseService.cs"), BuildIBaseServiceSource(namespaceRoot));
         WriteIfMissing(log, Path.Combine(businessDirectory, "Base", "BaseService.cs"), BuildBaseServiceSource(namespaceRoot));
 
-        RunDotnet(log, persistenceDirectory, "add \"" + csprojPathByLayer["Persistence.Database"] + "\" package Microsoft.EntityFrameworkCore");
-        RunDotnet(log, persistenceDirectory, "add \"" + csprojPathByLayer["Persistence.Database"] + "\" package Microsoft.EntityFrameworkCore.SqlServer");
+        RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore");
+        RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore.SqlServer");
     }
 
     private static string BuildArgentinaTimeSource(string namespaceRoot)
@@ -165,9 +176,29 @@ public static class SolutionScaffoldTool
         return "namespace " + namespaceRoot + ".Domain.Common;\n\n"
             + "public static class ArgentinaTime\n"
             + "{\n"
-            + "    private static readonly TimeZoneInfo Zone =\n"
-            + "        TimeZoneInfo.FindSystemTimeZoneById(\"Argentina Standard Time\");\n\n"
-            + "    public static DateTime Now => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Zone);\n"
+            + "    private static readonly TimeZoneInfo Zone = ResolveZone();\n\n"
+            + "    public static DateTime Now => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Zone);\n\n"
+            + "    // IANA (Linux, macOS, contenedores) primero, después el id de Windows; si el sistema no\n"
+            + "    // tiene base de zonas horarias (imágenes mínimas sin ICU/tzdata), UTC-3 fijo: Argentina no\n"
+            + "    // usa horario de verano desde 2009.\n"
+            + "    private static TimeZoneInfo ResolveZone()\n"
+            + "    {\n"
+            + "        string[] ids = { \"America/Argentina/Buenos_Aires\", \"Argentina Standard Time\" };\n\n"
+            + "        foreach (string id in ids)\n"
+            + "        {\n"
+            + "            try\n"
+            + "            {\n"
+            + "                return TimeZoneInfo.FindSystemTimeZoneById(id);\n"
+            + "            }\n"
+            + "            catch (TimeZoneNotFoundException)\n"
+            + "            {\n"
+            + "            }\n"
+            + "            catch (InvalidTimeZoneException)\n"
+            + "            {\n"
+            + "            }\n"
+            + "        }\n\n"
+            + "        return TimeZoneInfo.CreateCustomTimeZone(\"Argentina\", TimeSpan.FromHours(-3), \"Argentina\", \"Argentina\");\n"
+            + "    }\n"
             + "}\n";
     }
 
@@ -374,6 +405,16 @@ public static class SolutionScaffoldTool
             + "}\n";
     }
 
+    private static string QuoteForLog(string argument)
+    {
+        if (argument.Contains(' ') || argument.Contains('"'))
+        {
+            return "\"" + argument.Replace("\"", "\\\"") + "\"";
+        }
+
+        return argument;
+    }
+
     private static void WriteIfMissing(StringBuilder log, string filePath, string content)
     {
         if (File.Exists(filePath))
@@ -404,7 +445,7 @@ public static class SolutionScaffoldTool
             return existing;
         }
 
-        RunDotnet(log, solutionRootPath, "new sln -n " + namespaceRoot + " -o \"" + solutionRootPath + "\"");
+        RunDotnet(log, solutionRootPath, "new", "sln", "-n", namespaceRoot, "-o", solutionRootPath);
 
         string created = Directory.GetFiles(solutionRootPath, "*.slnx")
             .Concat(Directory.GetFiles(solutionRootPath, "*.sln"))
@@ -413,12 +454,15 @@ public static class SolutionScaffoldTool
         return created;
     }
 
-    private static void RunDotnet(StringBuilder log, string workingDirectory, string arguments)
+    /// <summary>
+    /// Runs the dotnet CLI passing each argument separately (ArgumentList), so paths with spaces or
+    /// quotes are never re-parsed into extra arguments.
+    /// </summary>
+    private static void RunDotnet(StringBuilder log, string workingDirectory, params string[] arguments)
     {
         ProcessStartInfo startInfo = new ProcessStartInfo
         {
             FileName = "dotnet",
-            Arguments = arguments,
             WorkingDirectory = workingDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -426,13 +470,18 @@ public static class SolutionScaffoldTool
             CreateNoWindow = true,
         };
 
+        foreach (string argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
         using Process process = new Process { StartInfo = startInfo };
         process.Start();
         string stdOut = process.StandardOutput.ReadToEnd();
         string stdErr = process.StandardError.ReadToEnd();
         process.WaitForExit();
 
-        log.AppendLine("$ dotnet " + arguments);
+        log.AppendLine("$ dotnet " + string.Join(" ", arguments.Select(QuoteForLog)));
 
         if (process.ExitCode != 0)
         {

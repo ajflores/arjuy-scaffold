@@ -241,10 +241,22 @@ propio `.csproj`, que esta tool no genera). `Business` es **un solo proyecto** q
 
 ## Cómo compilar
 
+Windows:
+
 ```powershell
 cd C:\Users\floaj\OneDrive\Documentos\Desarrollo\mcp\arjuy-scaffold
-dotnet build
+dotnet build -c Release
 ```
+
+Linux:
+
+```bash
+cd ~/Documents/Desarrollo/arjuy-scaffold
+dotnet build -c Release
+```
+
+Después de cada cambio hay que volver a compilar y reiniciar la sesión de Claude Code (el server
+se registra apuntando al `.dll` de Release).
 
 Build verificado sin errores ni warnings con .NET SDK 10.0.400, `TargetFramework=net10.0`, incluyendo
 las 4 tools agregadas en la segunda iteración (`generate_ef_configuration`, `generate_dto`,
@@ -301,6 +313,33 @@ Alternativa apuntando directamente al `.dll` ya compilado (arranque más rápido
   }
 }
 ```
+
+### Linux (registro a nivel usuario, disponible en todos los proyectos)
+
+Con .NET instalado vía mise, usar la ruta absoluta de `dotnet` y pasarle `PATH`/`DOTNET_ROOT`,
+porque `generate_solution_layout` ejecuta la CLI de `dotnet`:
+
+```bash
+D=~/.local/share/mise/dotnet-root
+claude mcp add --scope user arjuy-scaffold \
+  -e DOTNET_ROOT=$D -e "PATH=$D:/usr/local/bin:/usr/bin:/bin" \
+  -- $D/dotnet ~/Documents/Desarrollo/arjuy-scaffold/bin/Release/net10.0/arjuy-scaffold.dll
+claude mcp get arjuy-scaffold   # debe decir "Connected"
+```
+
+## Cambios de la iteración 3
+
+- `generate_entity` agrega `using {Root}.Domain.Common;` (derivado de `namespaceName`, o vía el
+  nuevo parámetro `baseEntityNamespace`) y inicializa `string` con `= string.Empty` y las colecciones
+  con `= new List<T>()`: la entidad generada compila sin warnings con `Nullable=enable`.
+- `ArgentinaTime` (sembrado por `generate_solution_layout`) busca primero la zona IANA
+  `America/Argentina/Buenos_Aires`, después `Argentina Standard Time` (Windows) y, si el sistema no
+  tiene base de zonas horarias (contenedores mínimos), cae a UTC-3 fijo.
+- `generate_solution_layout` ejecuta `dotnet` con `ProcessStartInfo.ArgumentList` (cada argumento
+  por separado: rutas con espacios o comillas ya no se re-interpretan) y valida que `namespaceRoot`
+  sea un namespace C# válido.
+- Verificado en Linux: layout completo en una ruta con espacios + entidad generada → `dotnet build`
+  de la solución generada con 0 errores y 0 warnings.
 
 ## Estructura del proyecto
 
