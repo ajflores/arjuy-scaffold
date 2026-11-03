@@ -1,6 +1,9 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Text;
+using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -23,11 +26,13 @@ public static class MiddlewareConfigTool
         "UseXxxConfig-style WebApplication extension method). No expression-bodied members — " +
         "explicit block bodies with 'return' everywhere. Note: 'middleware' here means a " +
         "configuration extension method, not a classic ASP.NET Core pipeline middleware. Returns " +
-        "the generated C# source as a string; does not write files to disk.")]
-    public static string GenerateMiddlewareConfig(
+        "a list with ONE {path, content} file (Api/ConfigServices/{Name}Config.cs); writes to disk only when 'outputDirectoryPath' is provided.")]
+    public static List<GeneratedFile> GenerateMiddlewareConfig(
         [Description("Config name in PascalCase, e.g. 'Jwt', 'Cors', 'Swagger'. Generates {Name}Config.")] string configName,
         [Description("Namespace for the generated static class. Defaults to a generated ConfigServices namespace if omitted.")] string? namespaceName = null,
-        [Description("When true, also generates a WebApplication 'Use{Name}Config' extension method for pipeline wiring, in addition to the IServiceCollection 'Add{Name}Config' one.")] bool includeAppExtension = false)
+        [Description("When true, also generates a WebApplication 'Use{Name}Config' extension method for pipeline wiring, in addition to the IServiceCollection 'Add{Name}Config' one.")] bool includeAppExtension = false,
+        [Description("Optional root namespace/project prefix (e.g. 'MyApp') used for the relative file path of the result. Defaults to 'Generated'.")] string? namespaceRoot = null,
+        [Description("Optional absolute path to the SOLUTION root. When provided, the returned file is also written under it. Opt-in, disabled by default.")] string? outputDirectoryPath = null)
     {
         if (string.IsNullOrWhiteSpace(configName))
         {
@@ -48,7 +53,7 @@ public static class MiddlewareConfigTool
         sourceBuilder.AppendLine("{");
         sourceBuilder.AppendLine("    public static IServiceCollection Add" + className + "(this IServiceCollection services, IConfiguration configuration)");
         sourceBuilder.AppendLine("    {");
-        sourceBuilder.AppendLine("        // TODO: register " + configName + " services here, reading options from 'configuration'.");
+        sourceBuilder.AppendLine("        // TODO: registrar los servicios de " + configName + " aquí, leyendo las opciones desde 'configuration'.");
         sourceBuilder.AppendLine("        return services;");
         sourceBuilder.AppendLine("    }");
 
@@ -57,13 +62,19 @@ public static class MiddlewareConfigTool
             sourceBuilder.AppendLine();
             sourceBuilder.AppendLine("    public static WebApplication Use" + className + "(this WebApplication app)");
             sourceBuilder.AppendLine("    {");
-            sourceBuilder.AppendLine("        // TODO: wire " + configName + " into the request pipeline here.");
+            sourceBuilder.AppendLine("        // TODO: conectar " + configName + " al pipeline de requests aquí.");
             sourceBuilder.AppendLine("        return app;");
             sourceBuilder.AppendLine("    }");
         }
 
         sourceBuilder.AppendLine("}");
 
-        return sourceBuilder.ToString();
+        List<GeneratedFile> files = new List<GeneratedFile>
+        {
+            new GeneratedFile(FeaturePaths.ApiConfig(namespaceRoot, className), sourceBuilder.ToString()),
+        };
+
+        GeneratedFileWriter.WriteAll(outputDirectoryPath, files);
+        return files;
     }
 }

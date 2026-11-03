@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Linq;
 using System.Text;
 using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -46,15 +47,15 @@ public static class ServiceTool
         "methods you pass. The interface still declares the 3 inherited CRUD signatures (they are " +
         "satisfied implicitly by BaseService's public virtual methods, not re-implemented here). " +
         "Every method returns MResult<T>; custom methods wrap their body in try/catch -> " +
-        "MResult<T>.Fail(ex.Message). Returns both files concatenated into one annotated string. " +
-        "If 'interfaceOutputFilePath'/'classOutputFilePath' are provided, ALSO writes each one to " +
+        "MResult<T>.Fail(ex.Message). Returns a list of {path, content} files (interface and class " +
+        "ALWAYS in separate files). If 'outputDirectoryPath' is provided, or " +
+        "'interfaceOutputFilePath'/'classOutputFilePath' are provided, ALSO writes each one to " +
         "its own file on disk (opt-in, disabled by default) — interface and class are NEVER " +
         "written to the same file, matching the real Interfaces/ vs Services/ folder split.")]
-    public static string GenerateService(
+    public static List<GeneratedFile> GenerateService(
         [Description("Entity name in PascalCase, e.g. 'Category'. Generates ICategoryService/CategoryService.")] string entityName,
         [Description("Custom methods beyond the inherited GetByIdAsync/GetAllAsync/DeleteAsync. Each becomes Task<MResult<ReturnType>> Name(params) on both interface and class. Omit or pass an empty list for none.")] List<MethodDefinition>? customMethods,
         [Description("REQUIRED, no default: 'mapperly' or 'automapper' — same conscious licensing choice as generate_mapper, since MapToResponse needs a mapper.")] string mapperProvider,
-        [Description("Mapperly only: module name for the mapper type ({Module}Mapper) this service depends on. Defaults to entityName when omitted. Ignored for provider='automapper' (mapper type is always 'IMapper').")] string? moduleName = null,
         [Description("Name of the response DTO type. Defaults to '{entityName}ResponseModel'.")] string? responseModelName = null,
         [Description("Name of the entity-specific repository interface this service depends on. Defaults to 'I{entityName}Repository'.")] string? repositoryInterfaceName = null,
         [Description("Name of the generic base service class entities inherit from. Defaults to 'BaseService', the arjuy* convention (Business/Base/BaseService.cs).")] string? baseServiceClassName = null,
@@ -63,11 +64,13 @@ public static class ServiceTool
         [Description("Namespace for the generated class. Defaults to a generated namespace if omitted.")] string? classNamespace = null,
         [Description("Namespace where the entity-specific repository interface lives. Defaults to a generated namespace if omitted.")] string? repositoryNamespace = null,
         [Description("Namespace where the response DTO lives. Defaults to a generated namespace if omitted.")] string? dtoNamespace = null,
-        [Description("Mapperly only: namespace where the {Module}Mapper type lives. Defaults to a generated namespace if omitted. Ignored for provider='automapper' (uses the AutoMapper package's IMapper).")] string? mapperNamespace = null,
+        [Description("Mapperly only: namespace where the {Entity}Mapper type lives. Defaults to a generated namespace if omitted. Ignored for provider='automapper' (uses the AutoMapper package's IMapper).")] string? mapperNamespace = null,
         [Description("Namespace where BaseService lives. Defaults to a generated namespace if omitted.")] string? baseNamespace = null,
         [Description("Namespace where MResult<T> lives (Domain.Common convention). Defaults to a generated namespace if omitted.")] string? domainCommonNamespace = null,
         [Description("Optional absolute path to also write the generated interface .cs file to disk. When omitted, no file is written.")] string? interfaceOutputFilePath = null,
-        [Description("Optional absolute path to also write the generated class .cs file to disk. When omitted, no file is written.")] string? classOutputFilePath = null)
+        [Description("Optional absolute path to also write the generated class .cs file to disk. When omitted, no file is written.")] string? classOutputFilePath = null,
+        [Description("Optional root namespace/project prefix (e.g. 'MyApp') used for the relative file paths of the result. Defaults to 'Generated'.")] string? namespaceRoot = null,
+        [Description("Optional absolute path to the SOLUTION root. When provided, the returned files are also written under it. Opt-in, disabled by default.")] string? outputDirectoryPath = null)
     {
         if (string.IsNullOrWhiteSpace(entityName))
         {
@@ -99,7 +102,6 @@ public static class ServiceTool
             entityName: entityName,
             customMethods: resolvedCustomMethods,
             normalizedMapperProvider: normalizedProvider,
-            moduleName: moduleName,
             responseModelName: responseModelName,
             repositoryInterfaceName: repositoryInterfaceName,
             baseServiceClassName: baseServiceClassName,
@@ -115,13 +117,14 @@ public static class ServiceTool
         WriteIfRequested(interfaceOutputFilePath, interfaceSource);
         WriteIfRequested(classOutputFilePath, classSource);
 
-        StringBuilder combined = new StringBuilder();
-        combined.AppendLine("// ----- Interface (Business/Interfaces/I" + entityName + "Service.cs) -----");
-        combined.AppendLine(interfaceSource);
-        combined.AppendLine("// ----- Class (Business/Services/" + entityName + "Service.cs) -----");
-        combined.AppendLine(classSource);
+        List<GeneratedFile> files = new List<GeneratedFile>
+        {
+            new GeneratedFile(FeaturePaths.ServiceInterface(namespaceRoot, entityName), interfaceSource),
+            new GeneratedFile(FeaturePaths.ServiceClass(namespaceRoot, entityName), classSource),
+        };
 
-        return combined.ToString();
+        GeneratedFileWriter.WriteAll(outputDirectoryPath, files);
+        return files;
     }
 
     internal static string BuildInterfaceSource(
@@ -133,7 +136,7 @@ public static class ServiceTool
         string? domainCommonNamespace)
     {
         string resolvedInterfaceNamespace = interfaceNamespace ?? "ArjuyScaffold.Generated.Business.Interfaces";
-        string resolvedDtoNamespace = dtoNamespace ?? "ArjuyScaffold.Generated.Business.Models";
+        string resolvedDtoNamespace = dtoNamespace ?? ("ArjuyScaffold.Generated.Business.Models." + FeaturePaths.ModelFolder(entityName));
         string resolvedDomainCommonNamespace = domainCommonNamespace ?? "ArjuyScaffold.Generated.Domain.Common";
         string resolvedResponseModel = string.IsNullOrWhiteSpace(responseModelName) ? entityName + "ResponseModel" : responseModelName;
         string interfaceName = "I" + entityName + "Service";
@@ -167,7 +170,6 @@ public static class ServiceTool
         string entityName,
         List<MethodDefinition> customMethods,
         string normalizedMapperProvider,
-        string? moduleName,
         string? responseModelName,
         string? repositoryInterfaceName,
         string? baseServiceClassName,
@@ -184,7 +186,7 @@ public static class ServiceTool
         string resolvedInterfaceNamespace = interfaceNamespace ?? "ArjuyScaffold.Generated.Business.Interfaces";
         string resolvedEntityNamespace = entityNamespace ?? "ArjuyScaffold.Generated.Domain.Entities";
         string resolvedRepositoryNamespace = repositoryNamespace ?? "ArjuyScaffold.Generated.Repository.Interfaces";
-        string resolvedDtoNamespace = dtoNamespace ?? "ArjuyScaffold.Generated.Business.Models";
+        string resolvedDtoNamespace = dtoNamespace ?? ("ArjuyScaffold.Generated.Business.Models." + FeaturePaths.ModelFolder(entityName));
         string resolvedBaseNamespace = baseNamespace ?? "ArjuyScaffold.Generated.Business.Base";
         string resolvedDomainCommonNamespace = domainCommonNamespace ?? "ArjuyScaffold.Generated.Domain.Common";
 
@@ -203,8 +205,7 @@ public static class ServiceTool
 
         if (normalizedMapperProvider == "mapperly")
         {
-            string resolvedModuleName = string.IsNullOrWhiteSpace(moduleName) ? entityName : moduleName;
-            mapperTypeName = resolvedModuleName + "Mapper";
+            mapperTypeName = entityName + "Mapper";
             mapperUsingNamespace = mapperNamespace ?? "ArjuyScaffold.Generated.Business.Mappers";
             mapToResponseCall = "_mapper.To" + entityName + "ResponseModel(entity)";
         }
@@ -268,7 +269,8 @@ public static class ServiceTool
         sourceBuilder.AppendLine("    {");
         sourceBuilder.AppendLine("        try");
         sourceBuilder.AppendLine("        {");
-        sourceBuilder.AppendLine("            // TODO: implement " + method.Name + " business logic.");
+        sourceBuilder.AppendLine("            // TODO: implementar la lógica de negocio de " + method.Name + ".");
+        sourceBuilder.AppendLine("            await Task.CompletedTask;");
         sourceBuilder.AppendLine("            throw new NotImplementedException();");
         sourceBuilder.AppendLine("        }");
         sourceBuilder.AppendLine("        catch (Exception ex)");

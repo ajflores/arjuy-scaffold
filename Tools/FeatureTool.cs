@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -37,13 +38,18 @@ public static class FeatureTool
         "default — same conscious licensing choice as generate_mapper). Internally calls the same " +
         "static generation methods used by generate_entity/generate_repository/generate_service/" +
         "generate_ef_configuration/generate_dto/generate_mapper — nothing is reimplemented. Returns " +
-        "all generated files concatenated into one annotated string; when 'outputDirectoryPath' is " +
+        "a list of {path, content} files — ONE FILE PER PUBLIC TYPE, file name = type name (entity, " +
+        "I{Entity}Repository, {Entity}Repository, I{Entity}Service, {Entity}Service, " +
+        "{Entity}Configuration, {Entity}ResponseModel, {Entity}RequestModel under " +
+        "Business/Models/{PluralEntity}/, mapper); when 'outputDirectoryPath' is " +
         "provided, ALSO writes each file to disk under the standard 5-layer folder layout (opt-in, " +
         "disabled by default, same pattern as generate_entity's 'outputFilePath'). Does NOT " +
         "generate a CRUD controller, does NOT touch AppDbContext (no DbSet is added), and does NOT " +
-        "register the mapper in DI — these 3 steps are listed as pending manual work in the " +
-        "returned result.")]
-    public static string GenerateFeature(
+        "register the mapper in DI. PENDING MANUAL STEPS: (1) add 'public DbSet<{Entity}> {PluralEntity} " +
+        "{ get; set; }' to AppDbContext; (2) AutoMapper only: ONE AddAutoMapper(_ => { }, " +
+        "typeof(AnyProfile)) per assembly (Mapperly needs no DI registration); (3) the CRUD " +
+        "controller. Use the files returned here as-is — do NOT rewrite them by hand.")]
+    public static List<GeneratedFile> GenerateFeature(
         [Description("Entity name in PascalCase, e.g. 'Category'.")] string entityName,
         [Description("Properties shared across Entity, DTOs and EF configuration (name, type, plus EF-only IsRequired/MaxLength). Do NOT include Id, CreatedAt, UpdatedAt or Deleted — those are inherited from the base entity.")] List<FeaturePropertyDefinition> properties,
         [Description("REQUIRED, no default: 'mapperly' or 'automapper'. See generate_mapper for the full rationale — this is a licensing decision, not a technical default.")] string mapperProvider,
@@ -51,8 +57,7 @@ public static class FeatureTool
         [Description("Service methods to generate (each returns MResult<T>). Omit or pass an empty list for none.")] List<MethodDefinition>? serviceMethods = null,
         [Description("Optional EF Core relationships to configure (HasMany/HasOne + WithOne/WithMany + optional HasForeignKey + OnDelete). Omit or pass an empty list for an entity with no navigation properties.")] List<EfRelationDefinition>? efRelations = null,
         [Description("When true, the EF configuration OMITS HasQueryFilter(x => !x.Deleted) — use for lookup/catalog entities. Defaults to false.")] bool isLookup = false,
-        [Description("Mapperly only: module name for the generated {Module}Mapper class. Defaults to entityName when omitted. Ignored for provider='automapper'.")] string? moduleName = null,
-        [Description("Optional root namespace (e.g. 'ArjuyTurismo') used to derive every layer's namespace automatically: {root}.Domain.Entities, {root}.Repository.Interfaces/.Repositories/.Base, {root}.Persistence.Database(.Configurations), {root}.Business.Services/.Models/.Mappers(or .Mappings). When omitted, every layer falls back to its own tool's default 'ArjuyScaffold.Generated.*' namespace.")] string? namespaceRoot = null,
+        [Description("Optional root namespace (e.g. 'ArjuyTurismo') used to derive every layer's namespace automatically: {root}.Domain.Entities, {root}.Repository.Interfaces/.Repositories/.Base, {root}.Persistence.Database(.Configurations), {root}.Business.Services/.Models.{PluralEntity}/.Mappers(or .Mappings). When omitted, every layer falls back to its own tool's default 'ArjuyScaffold.Generated.*' namespace.")] string? namespaceRoot = null,
         [Description("Name of the base class entities inherit from. Defaults to 'Entity', the arjuy* Clean Architecture convention.")] string? baseEntityName = null,
         [Description("DbContext type name injected into the repository constructor. Defaults to 'AppDbContext'.")] string? dbContextTypeName = null,
         [Description("Name of the generic base repository interface. Defaults to 'IBaseRepository'.")] string? baseRepositoryInterfaceName = null,
@@ -77,7 +82,6 @@ public static class FeatureTool
         }
 
         List<FeaturePropertyDefinition> resolvedProperties = properties ?? new List<FeaturePropertyDefinition>();
-        string resolvedModuleName = string.IsNullOrWhiteSpace(moduleName) ? entityName : moduleName;
 
         string? entityNamespace = null;
         string? repositoryInterfaceNamespace = null;
@@ -101,7 +105,7 @@ public static class FeatureTool
             serviceInterfaceNamespace = namespaceRoot + ".Business.Interfaces";
             serviceClassNamespace = namespaceRoot + ".Business.Services";
             serviceBaseNamespace = namespaceRoot + ".Business.Base";
-            dtoNamespace = namespaceRoot + ".Business.Models";
+            dtoNamespace = namespaceRoot + ".Business.Models." + FeaturePaths.ModelFolder(entityName);
             mapperNamespace = normalizedProvider == "mapperly" ? namespaceRoot + ".Business.Mappers" : namespaceRoot + ".Business.Mappings";
             efConfigurationNamespace = namespaceRoot + ".Persistence.Database.Configurations";
         }
@@ -114,24 +118,30 @@ public static class FeatureTool
             .Select(property => new EfPropertyDefinition { Name = property.Name, IsRequired = property.IsRequired, MaxLength = property.MaxLength })
             .ToList();
 
-        string entitySource = EntityTool.GenerateEntity(
+        string? root = namespaceRoot;
+        string entitySource = EntityTool.BuildEntitySource(
             entityName: entityName,
             properties: plainProperties,
             namespaceName: entityNamespace,
             baseEntityName: baseEntityName,
-            outputFilePath: null);
+            baseEntityNamespace: null);
 
-        string repositorySource = RepositoryTool.GenerateRepository(
-            entityName: entityName,
-            customMethods: repositoryCustomMethods,
-            entityNamespace: entityNamespace,
-            interfaceNamespace: repositoryInterfaceNamespace,
-            implementationNamespace: repositoryImplementationNamespace,
-            baseNamespace: repositoryBaseNamespace,
-            dbContextNamespace: dbContextNamespace,
-            dbContextTypeName: dbContextTypeName,
-            baseRepositoryInterfaceName: baseRepositoryInterfaceName,
-            baseRepositoryClassName: baseRepositoryClassName);
+        string resolvedEntityNs = entityNamespace ?? "ArjuyScaffold.Generated.Domain.Entities";
+        string resolvedRepoInterfaceNs = repositoryInterfaceNamespace ?? "ArjuyScaffold.Generated.Repository.Interfaces";
+        string resolvedRepoImplementationNs = repositoryImplementationNamespace ?? "ArjuyScaffold.Generated.Repository.Repositories";
+        string resolvedRepoBaseNs = repositoryBaseNamespace ?? "ArjuyScaffold.Generated.Repository.Base";
+        string resolvedDbContextNs = dbContextNamespace ?? "ArjuyScaffold.Generated.Persistence.Database";
+        string resolvedDbContextName = string.IsNullOrWhiteSpace(dbContextTypeName) ? "AppDbContext" : dbContextTypeName;
+        string resolvedBaseRepoInterface = string.IsNullOrWhiteSpace(baseRepositoryInterfaceName) ? "IBaseRepository" : baseRepositoryInterfaceName;
+        string resolvedBaseRepoClass = string.IsNullOrWhiteSpace(baseRepositoryClassName) ? "BaseRepository" : baseRepositoryClassName;
+        List<RepositoryMethodDefinition> repositoryMethods = repositoryCustomMethods ?? new List<RepositoryMethodDefinition>();
+
+        string repositoryInterfaceSource = RepositoryTool.BuildInterfaceSource(
+            "I" + entityName + "Repository", entityName, resolvedEntityNs, resolvedRepoInterfaceNs, resolvedRepoBaseNs, resolvedBaseRepoInterface, repositoryMethods);
+
+        string repositoryClassSource = RepositoryTool.BuildClassSource(
+            entityName + "Repository", "I" + entityName + "Repository", entityName, resolvedEntityNs, resolvedRepoImplementationNs, resolvedRepoBaseNs,
+            resolvedRepoInterfaceNs, resolvedDbContextNs, resolvedBaseRepoClass, resolvedDbContextName, repositoryMethods);
 
         List<MethodDefinition> resolvedServiceMethods = serviceMethods ?? new List<MethodDefinition>();
 
@@ -141,13 +151,12 @@ public static class FeatureTool
             responseModelName: null,
             interfaceNamespace: serviceInterfaceNamespace,
             dtoNamespace: dtoNamespace,
-            domainCommonNamespace: null);
+            domainCommonNamespace: namespaceRoot == null ? null : namespaceRoot + ".Domain.Common");
 
         string serviceClassSource = ServiceTool.BuildClassSource(
             entityName: entityName,
             customMethods: resolvedServiceMethods,
             normalizedMapperProvider: normalizedProvider,
-            moduleName: moduleName,
             responseModelName: null,
             repositoryInterfaceName: null,
             baseServiceClassName: null,
@@ -158,9 +167,9 @@ public static class FeatureTool
             dtoNamespace: dtoNamespace,
             mapperNamespace: mapperNamespace,
             baseNamespace: serviceBaseNamespace,
-            domainCommonNamespace: null);
+            domainCommonNamespace: namespaceRoot == null ? null : namespaceRoot + ".Domain.Common");
 
-        string efConfigurationSource = EfConfigurationTool.GenerateEfConfiguration(
+        string efConfigurationSource = EfConfigurationTool.BuildEfConfigurationSource(
             entityName: entityName,
             properties: efProperties,
             relations: efRelations,
@@ -169,87 +178,36 @@ public static class FeatureTool
             namespaceName: efConfigurationNamespace,
             entityNamespace: entityNamespace);
 
-        string dtoSource = DtoTool.GenerateDto(
+        List<GeneratedFile> dtoFiles = DtoTool.GenerateDto(
             entityName: entityName,
             properties: plainProperties,
-            namespaceName: dtoNamespace);
+            namespaceName: dtoNamespace,
+            namespaceRoot: root,
+            outputDirectoryPath: null);
 
-        string mapperSource = MapperTool.GenerateMapper(
-            provider: normalizedProvider,
+        GeneratedFile mapperFile = MapperTool.BuildMapperFile(
+            normalizedProvider: normalizedProvider,
             entityName: entityName,
-            moduleName: moduleName,
             hasDerivedResponseFields: hasDerivedResponseFields,
             namespaceName: mapperNamespace,
             entityNamespace: entityNamespace,
-            dtoNamespace: dtoNamespace);
+            dtoNamespace: dtoNamespace,
+            namespaceRoot: root);
 
-        StringBuilder resultBuilder = new StringBuilder();
-        resultBuilder.AppendLine("// ===== generate_feature: " + entityName + " (mapperProvider=" + normalizedProvider + ") =====");
-        resultBuilder.AppendLine("// Generated 7 files: Entity, Repository (interface+impl), Service Interface, Service Class");
-        resultBuilder.AppendLine("// (inherits BaseService<TEntity, TResponseModel>), EF Configuration, DTOs (Response/Request),");
-        resultBuilder.AppendLine("// Mapper (" + normalizedProvider + ").");
-        resultBuilder.AppendLine("//");
-        resultBuilder.AppendLine("// PENDING MANUAL STEPS (NOT automated by this tool):");
-        resultBuilder.AppendLine("//   1. Add 'public DbSet<" + entityName + "> " + entityName + "s { get; set; }' to AppDbContext.");
-
-        if (normalizedProvider == "mapperly")
+        List<GeneratedFile> files = new List<GeneratedFile>
         {
-            resultBuilder.AppendLine("//   2. Mapperly needs NO DI registration (compile-time source generator) — nothing to do here.");
-        }
-        else
-        {
-            resultBuilder.AppendLine("//   2. Ensure AddAutoMapper(_ => { }, typeof(AnyProfileInThisAssembly)) already runs for this");
-            resultBuilder.AppendLine("//      assembly (see the generated mapper file's trailing comment) — a ONE-TIME step per");
-            resultBuilder.AppendLine("//      assembly, not per entity.");
-        }
+            new GeneratedFile(FeaturePaths.Entity(root, entityName), entitySource),
+            new GeneratedFile(FeaturePaths.RepositoryInterface(root, entityName), repositoryInterfaceSource),
+            new GeneratedFile(FeaturePaths.RepositoryClass(root, entityName), repositoryClassSource),
+            new GeneratedFile(FeaturePaths.ServiceInterface(root, entityName), serviceInterfaceSource),
+            new GeneratedFile(FeaturePaths.ServiceClass(root, entityName), serviceClassSource),
+            new GeneratedFile(FeaturePaths.EfConfiguration(root, entityName), efConfigurationSource),
+        };
+        files.AddRange(dtoFiles);
+        files.Add(mapperFile);
 
-        resultBuilder.AppendLine("//   3. No CRUD controller is generated yet — out of scope for this iteration.");
-        resultBuilder.AppendLine();
+        GeneratedFileWriter.WriteAll(outputDirectoryPath, files);
 
-        AppendSection(resultBuilder, "Entity", entitySource);
-        AppendSection(resultBuilder, "Repository", repositorySource);
-        AppendSection(resultBuilder, "Service Interface", serviceInterfaceSource);
-        AppendSection(resultBuilder, "Service Class", serviceClassSource);
-        AppendSection(resultBuilder, "EF Configuration", efConfigurationSource);
-        AppendSection(resultBuilder, "DTOs", dtoSource);
-        AppendSection(resultBuilder, "Mapper (" + normalizedProvider + ")", mapperSource);
-
-        if (!string.IsNullOrWhiteSpace(outputDirectoryPath))
-        {
-            string projectPrefix = string.IsNullOrWhiteSpace(namespaceRoot) ? "Generated" : namespaceRoot;
-
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Domain", "Entities", entityName + ".cs"), entitySource);
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Repository", entityName + "Repository.cs"), repositorySource);
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Interfaces", "I" + entityName + "Service.cs"), serviceInterfaceSource);
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Services", entityName + "Service.cs"), serviceClassSource);
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Persistence.Database", "Configurations", entityName + "Configuration.cs"), efConfigurationSource);
-            WriteFile(outputDirectoryPath, Path.Combine(projectPrefix + ".Business", "Models", entityName + "Models.cs"), dtoSource);
-
-            string mapperFileName = normalizedProvider == "mapperly"
-                ? Path.Combine(projectPrefix + ".Business", "Mappers", resolvedModuleName + "Mapper.cs")
-                : Path.Combine(projectPrefix + ".Business", "Mappings", entityName + "Profile.cs");
-            WriteFile(outputDirectoryPath, mapperFileName, mapperSource);
-        }
-
-        return resultBuilder.ToString();
-    }
-
-    private static void AppendSection(StringBuilder resultBuilder, string title, string content)
-    {
-        resultBuilder.AppendLine("// ----- " + title + " -----");
-        resultBuilder.AppendLine(content);
-    }
-
-    private static void WriteFile(string rootDirectory, string relativePath, string content)
-    {
-        string fullPath = Path.Combine(rootDirectory, relativePath);
-        string? directory = Path.GetDirectoryName(fullPath);
-
-        if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        File.WriteAllText(fullPath, content);
+        return files;
     }
 }
