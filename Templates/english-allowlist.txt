@@ -1,0 +1,3 @@
+# Words skipped by check-english-identifiers.py (one per line, lower case).
+# Add only proper nouns or words that are ALSO valid English in your domain, and register each
+# entry in SLICES.md under "Desvios de la skill/MCP". Leave empty when in doubt.
