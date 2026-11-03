@@ -158,6 +158,12 @@ public static class SolutionScaffoldTool
         return log.ToString();
     }
 
+    /// <summary>Paquete que se referencia directo en Persistence.Database para corregir la vulnerabilidad transitiva.</summary>
+    public const string PkcsPackageName = "System.Security.Cryptography.Pkcs";
+
+    /// <summary>Versión mínima segura del paquete Pkcs (alineada con EF Core 10.0.14).</summary>
+    public const string PkcsPackageVersion = "10.0.14";
+
     private static void SeedBaseInfrastructure(StringBuilder log, string solutionRootPath, string namespaceRoot, Dictionary<string, string> csprojPathByLayer)
     {
         string domainDirectory = Path.GetDirectoryName(csprojPathByLayer["Domain"])!;
@@ -182,6 +188,9 @@ public static class SolutionScaffoldTool
 
         RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore");
         RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore.SqlServer");
+
+        // Referencia directa para elevar la versión transitiva vulnerable (NU1902/NU1903) que trae Microsoft.Data.SqlClient.
+        RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", PkcsPackageName, "--version", PkcsPackageVersion);
     }
 
     private static string BuildArgentinaTimeSource(string namespaceRoot)

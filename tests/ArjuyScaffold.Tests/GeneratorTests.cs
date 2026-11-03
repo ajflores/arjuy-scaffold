@@ -76,4 +76,11 @@ public class GeneratorTests
         Assert.Contains("BaseService<Edition, EditionResponseModel>", service.Content);
         Assert.Contains("using App.Business.Models.Editions;", service.Content);
     }
+
+    [Fact]
+    public void SolutionScaffold_PinsPkcsToFixedVersionForVulnerability()
+    {
+        Assert.Equal("System.Security.Cryptography.Pkcs", SolutionScaffoldTool.PkcsPackageName);
+        Assert.True(System.Version.Parse(SolutionScaffoldTool.PkcsPackageVersion) >= new System.Version(10, 0, 14));
+    }
 }
