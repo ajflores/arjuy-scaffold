@@ -1,6 +1,9 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Text;
+using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -24,10 +27,12 @@ public static class DependencyInjectionTool
         "I{Name}Repository -> {Name}Repository and I{Name}Service -> {Name}Service by naming " +
         "convention. It ignores the 'lifetime' parameter beyond choosing the registration call " +
         "and does not read any real assembly to confirm matches, nor validate an existing file. " +
-        "Returns generated C# source as a string; does not write files to disk.")]
-    public static string GenerateDependencyInjectionRegistration(
+        "Returns a list with ONE {path, content} file (Api/ConfigServices/DependencyInjectionConfig.cs); writes to disk only when 'outputDirectoryPath' is provided.")]
+    public static List<GeneratedFile> GenerateDependencyInjectionRegistration(
         [Description("Service lifetime to register with: 'Scoped', 'Transient' or 'Singleton'. Defaults to 'Scoped'.")] string lifetime = "Scoped",
-        [Description("Namespace for the generated static class. Defaults to a generated ConfigServices namespace if omitted.")] string? namespaceName = null)
+        [Description("Namespace for the generated static class. Defaults to a generated ConfigServices namespace if omitted.")] string? namespaceName = null,
+        [Description("Optional root namespace/project prefix (e.g. 'MyApp') used for the relative file path of the result. Defaults to 'Generated'.")] string? namespaceRoot = null,
+        [Description("Optional absolute path to the SOLUTION root. When provided, the returned file is also written under it. Opt-in, disabled by default.")] string? outputDirectoryPath = null)
     {
         string resolvedLifetime = string.IsNullOrWhiteSpace(lifetime) ? "Scoped" : lifetime;
         string resolvedNamespace = namespaceName ?? "ArjuyScaffold.Generated.Api.ConfigServices";
@@ -67,6 +72,12 @@ public static class DependencyInjectionTool
         sourceBuilder.AppendLine("    }");
         sourceBuilder.AppendLine("}");
 
-        return sourceBuilder.ToString();
+        List<GeneratedFile> files = new List<GeneratedFile>
+        {
+            new GeneratedFile(FeaturePaths.ApiConfig(namespaceRoot, "DependencyInjectionConfig"), sourceBuilder.ToString()),
+        };
+
+        GeneratedFileWriter.WriteAll(outputDirectoryPath, files);
+        return files;
     }
 }

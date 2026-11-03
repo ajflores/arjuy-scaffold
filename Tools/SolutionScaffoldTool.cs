@@ -6,6 +6,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -49,7 +51,7 @@ public static class SolutionScaffoldTool
         "AND Business directly, not just Business). When 'includeBaseInfrastructure' is true " +
         "(default), also seeds the base classes every other tool in this server ASSUMES already " +
         "exist — verified against the real files: Domain/Common/Entity.cs, ArgentinaTime.cs, " +
-        "MResult.cs; Persistence.Database/AppDbContext.cs (empty, no DbSets yet — those are added " +
+        "MResult.cs + ErrorType.cs (Validation/Unauthorized/Forbidden/NotFound/Conflict/Locked/Unexpected), and when apiProjectPath is given Api/Controllers/ApiControllerBase.cs (ErrorType -> HTTP code); also seeds scripts/ (check-conventions.py, check-english-identifiers.py, verify-conventions.py, english-allowlist.txt) at the solution root; Persistence.Database/AppDbContext.cs (empty, no DbSets yet — those are added " +
         "per entity as documented by generate_feature — but WITH " +
         "modelBuilder.ApplyConfigurationsFromAssembly(...) wired in OnModelCreating, so " +
         "generate_ef_configuration's output needs no manual registration); Repository/Base/" +
@@ -140,18 +142,29 @@ public static class SolutionScaffoldTool
                 {
                     RunDotnet(log, solutionRootPath, "add", apiProjectPath, "reference", csprojPathByLayer[layer]);
                 }
+
+                if (includeBaseInfrastructure)
+                {
+                    WriteIfMissing(log, Path.Combine(Path.GetDirectoryName(apiProjectPath)!, "Controllers", "ApiControllerBase.cs"), ApiControllerBaseTemplate.Build(namespaceRoot));
+                }
             }
         }
 
         if (includeBaseInfrastructure)
         {
-            SeedBaseInfrastructure(log, namespaceRoot, csprojPathByLayer);
+            SeedBaseInfrastructure(log, solutionRootPath, namespaceRoot, csprojPathByLayer);
         }
 
         return log.ToString();
     }
 
-    private static void SeedBaseInfrastructure(StringBuilder log, string namespaceRoot, Dictionary<string, string> csprojPathByLayer)
+    /// <summary>Paquete que se referencia directo en Persistence.Database para corregir la vulnerabilidad transitiva.</summary>
+    public const string PkcsPackageName = "System.Security.Cryptography.Pkcs";
+
+    /// <summary>Versión mínima segura del paquete Pkcs (alineada con EF Core 10.0.14).</summary>
+    public const string PkcsPackageVersion = "10.0.14";
+
+    private static void SeedBaseInfrastructure(StringBuilder log, string solutionRootPath, string namespaceRoot, Dictionary<string, string> csprojPathByLayer)
     {
         string domainDirectory = Path.GetDirectoryName(csprojPathByLayer["Domain"])!;
         string persistenceDirectory = Path.GetDirectoryName(csprojPathByLayer["Persistence.Database"])!;
@@ -161,6 +174,12 @@ public static class SolutionScaffoldTool
         WriteIfMissing(log, Path.Combine(domainDirectory, "Common", "ArgentinaTime.cs"), BuildArgentinaTimeSource(namespaceRoot));
         WriteIfMissing(log, Path.Combine(domainDirectory, "Common", "Entity.cs"), BuildEntitySource(namespaceRoot));
         WriteIfMissing(log, Path.Combine(domainDirectory, "Common", "MResult.cs"), BuildMResultSource(namespaceRoot));
+        WriteIfMissing(log, Path.Combine(domainDirectory, "Common", "ErrorType.cs"), BuildErrorTypeSource(namespaceRoot));
+        foreach (GeneratedFile scriptFile in ConventionsScript.AllFiles())
+        {
+            WriteIfMissing(log, Path.Combine(solutionRootPath, scriptFile.Path), scriptFile.Content);
+        }
+
         WriteIfMissing(log, Path.Combine(persistenceDirectory, "AppDbContext.cs"), BuildAppDbContextSource(namespaceRoot));
         WriteIfMissing(log, Path.Combine(repositoryDirectory, "Base", "IBaseRepository.cs"), BuildIBaseRepositorySource(namespaceRoot));
         WriteIfMissing(log, Path.Combine(repositoryDirectory, "Base", "BaseRepository.cs"), BuildBaseRepositorySource(namespaceRoot));
@@ -169,6 +188,9 @@ public static class SolutionScaffoldTool
 
         RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore");
         RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", "Microsoft.EntityFrameworkCore.SqlServer");
+
+        // Referencia directa para elevar la versión transitiva vulnerable (NU1902/NU1903) que trae Microsoft.Data.SqlClient.
+        RunDotnet(log, persistenceDirectory, "add", csprojPathByLayer["Persistence.Database"], "package", PkcsPackageName, "--version", PkcsPackageVersion);
     }
 
     private static string BuildArgentinaTimeSource(string namespaceRoot)
@@ -214,6 +236,23 @@ public static class SolutionScaffoldTool
             + "}\n";
     }
 
+    private static string BuildErrorTypeSource(string namespaceRoot)
+    {
+        return "namespace " + namespaceRoot + ".Domain.Common;\n\n"
+            + "/// <summary>Categoría de falla que transporta MResult; la capa API la traduce a un código HTTP.</summary>\n"
+            + "public enum ErrorType\n"
+            + "{\n"
+            + "    None = 0,\n"
+            + "    Validation = 400,\n"
+            + "    Unauthorized = 401,\n"
+            + "    Forbidden = 403,\n"
+            + "    NotFound = 404,\n"
+            + "    Conflict = 409,\n"
+            + "    Locked = 423,\n"
+            + "    Unexpected = 500\n"
+            + "}\n";
+    }
+
     private static string BuildMResultSource(string namespaceRoot)
     {
         return "namespace " + namespaceRoot + ".Domain.Common;\n\n"
@@ -222,6 +261,7 @@ public static class SolutionScaffoldTool
             + "    public bool IsSuccess { get; private set; }\n\n"
             + "    public T? Data { get; private set; }\n\n"
             + "    public string? Message { get; private set; }\n\n"
+            + "    public ErrorType ErrorType { get; private set; } = ErrorType.None;\n\n"
             + "    private MResult()\n"
             + "    {\n"
             + "    }\n\n"
@@ -233,9 +273,9 @@ public static class SolutionScaffoldTool
             + "    {\n"
             + "        return new MResult<T> { IsSuccess = true };\n"
             + "    }\n\n"
-            + "    public static MResult<T> Fail(string message)\n"
+            + "    public static MResult<T> Fail(string message, ErrorType errorType = ErrorType.Unexpected)\n"
             + "    {\n"
-            + "        return new MResult<T> { IsSuccess = false, Message = message };\n"
+            + "        return new MResult<T> { IsSuccess = false, Message = message, ErrorType = errorType };\n"
             + "    }\n"
             + "}\n";
     }
@@ -249,7 +289,7 @@ public static class SolutionScaffoldTool
             + "    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)\n"
             + "    {\n"
             + "    }\n\n"
-            + "    // TODO: add one DbSet<{Entity}> per entity here as they get generated by generate_feature.\n\n"
+            + "    // TODO: agregar aquí un DbSet<{Entity}> por cada entidad generada con generate_feature.\n\n"
             + "    protected override void OnModelCreating(ModelBuilder modelBuilder)\n"
             + "    {\n"
             + "        base.OnModelCreating(modelBuilder);\n\n"
@@ -361,7 +401,7 @@ public static class SolutionScaffoldTool
             + "            var entity = await _repository.GetByIdAsync(id);\n\n"
             + "            if (entity == null)\n"
             + "            {\n"
-            + "                return MResult<TResponseModel>.Fail(\"Registro no encontrado.\");\n"
+            + "                return MResult<TResponseModel>.Fail(\"Registro no encontrado.\", ErrorType.NotFound);\n"
             + "            }\n\n"
             + "            return MResult<TResponseModel>.Success(MapToResponse(entity));\n"
             + "        }\n"
@@ -391,7 +431,7 @@ public static class SolutionScaffoldTool
             + "            var entity = await _repository.GetByIdAsync(id);\n\n"
             + "            if (entity == null)\n"
             + "            {\n"
-            + "                return MResult<TResponseModel>.Fail(\"Registro no encontrado.\");\n"
+            + "                return MResult<TResponseModel>.Fail(\"Registro no encontrado.\", ErrorType.NotFound);\n"
             + "            }\n\n"
             + "            await _repository.DeleteAsync(entity);\n"
             + "            return MResult<TResponseModel>.Success();\n"

@@ -10,10 +10,99 @@ implementación mecánica del "cómo".
 ## Qué hace
 
 Servidor MCP por **stdio transport** (`ModelContextProtocol` 2.2.0 + `Microsoft.Extensions.Hosting`
-10.0.12, .NET 10) que expone 10 tools de generación de código C#. Ninguna tool escribe en disco
-por defecto — todas devuelven el código generado como string; `generate_entity` y `generate_feature`
-son las únicas con un parámetro opt-in (`outputFilePath` / `outputDirectoryPath`) para también
-escribirlo a disco.
+10.0.12, .NET 10) que expone 13 tools: generadores de código C# y verificación de convenciones.
+
+## Reglas de convenciones (obligatorias)
+
+1. **Identificadores en inglés.** Namespaces, tipos, miembros, parámetros, variables, valores de
+   enum, entidades, propiedades y rutas de API van en inglés (`Edition`, `GetByIdAsync`,
+   `/api/editions`). Los textos visibles al usuario (strings, mensajes) y el contenido de seed
+   pueden estar en español.
+2. **Comentarios en español.** Los comentarios `//` y los XML docs `///` se escriben en español
+   (las plantillas y el código generado ya los traen en español). Es una advertencia no bloqueante
+   del verificador (heurística de palabras inglesas comunes).
+3. **Un tipo por archivo.** Cada tipo público (clase, interfaz, enum, record) vive en su propio
+   archivo `.cs`, con el nombre del tipo, y el namespace sigue la carpeta.
+4. **Usar los generadores, no escribir a mano.** Entidades, DTOs, repositorios, servicios,
+   configuraciones EF y mappers se generan con estas tools; lo que el MCP no tenga se corrige en el
+   MCP, no se reemplaza con tipos propios (si es inevitable: desvío registrado en `SLICES.md`).
+5. **Verificar antes de cerrar** con `verify_conventions` o `python3 scripts/verify-conventions.py`.
+
+## Salida de las tools: lista de archivos `{path, content}`
+
+Todas las tools de generación devuelven una **lista de archivos** `{path, content}` (ruta relativa a
+la raíz de la solución), **uno por tipo público**. Ninguna escribe en disco por defecto; el
+parámetro opt-in `outputDirectoryPath` (raíz de la solución) escribe además los archivos
+(`generate_entity` y `generate_service` conservan además `outputFilePath` / `interfaceOutputFilePath`
+/ `classOutputFilePath`).
+
+Ejemplo de `generate_feature(entityName="Edition", mapperProvider="mapperly", namespaceRoot="Demo")`:
+
+```
+Demo.Domain/Entities/Edition.cs
+Demo.Repository/Interfaces/IEditionRepository.cs
+Demo.Repository/Repositories/EditionRepository.cs
+Demo.Business/Interfaces/IEditionService.cs
+Demo.Business/Services/EditionService.cs                  (hereda BaseService<Edition, EditionResponseModel>)
+Demo.Persistence.Database/Configurations/EditionConfiguration.cs
+Demo.Business/Models/Editions/EditionResponseModel.cs     (carpeta en PLURAL por entidad)
+Demo.Business/Models/Editions/EditionRequestModel.cs
+Demo.Business/Mappers/EditionMapper.cs                    (un mapper por entidad)
+```
+
+- **Modelos (DTOs) en subcarpetas por entidad**, en plural para que el namespace no choque con el
+  tipo de dominio: `Business/Models/Users/UserRequestModel.cs` (namespace
+  `{root}.Business.Models.Users`); los compartidos van en `Models/Common/` (p. ej.
+  `PaginationModel`). El `ResponseModel` incluye `int Id`, el `RequestModel` no.
+- **Un mapper por entidad**: `{Entity}Mapper.cs` (Mapperly, una clase `[Mapper]` por entidad, con
+  `[MapperIgnoreTarget]` para `Id`/`CreatedAt`/`UpdatedAt`/`Deleted`) o `{Entity}Profile.cs`
+  (AutoMapper, un `Profile` por entidad). Nunca un mapper agrupado por módulo. Ejemplo:
+  ```csharp
+  [Mapper]
+  public partial class EditionMapper
+  {
+      public partial Edition ToEditionEntity(EditionRequestModel source);
+      public partial EditionResponseModel ToEditionResponseModel(Edition source);
+  }
+  ```
+- Nombres de tabla por defecto: plural **en inglés** (`Category` → `Categories`,
+  `Address` → `Addresses`, `Person` → `People`).
+
+## Herramientas de verificación
+
+- `verify_conventions(solutionPath)` — corre `verify-conventions.py` sobre una solución y devuelve
+  `{passed, exitCode, output}`. Requiere `python3`.
+- `generate_conventions_check` — emite/actualiza en `scripts/`: `check-conventions.py`,
+  `check-english-identifiers.py`, `verify-conventions.py` y `english-allowlist.txt` (nunca
+  se pisa). `generate_solution_layout` los siembra automáticamente.
+- Línea de comandos: `python3 scripts/verify-conventions.py [--allow a,b] [ruta]` (exit 1 si hay
+  hallazgos). Códigos: **V1** un tipo por archivo / archivo = tipo / namespace = carpeta; **V2**
+  identificadores en español (diccionario de palabras comunes, ignora strings y comentarios; salida
+  `archivo:línea:identificador`); **V3** modelos en carpeta por entidad; **V4** un mapper por
+  entidad; **V5** servicios heredan `BaseService`; **V6** repositorios heredan `BaseRepository`;
+  **V7** tipos de infraestructura que no existen en el MCP (carpetas `Base/`/`Common/`, sufijos
+  `Base`, `Clock`, `Helper`...) se listan como **desvíos** y solo pasan si el tipo está registrado en
+  `SLICES.md` bajo "Desvíos de la skill/MCP"; **V8** (advertencia no bloqueante) comentarios en
+  inglés.
+- Allowlist del detector de español: `scripts/english-allowlist.txt` (una palabra por línea,
+  minúsculas, `#` comentarios) o `--allow palabra1,palabra2`. Usarla solo para nombres propios o
+  palabras válidas también en inglés, y registrar cada entrada en `SLICES.md`.
+- `check-conventions.py` y `check-english-identifiers.py` también se pueden correr por separado.
+
+## Errores HTTP: `ErrorType` + `ApiControllerBase`
+
+La plantilla trae `Domain/Common/ErrorType.cs` (`Validation`=400, `Unauthorized`=401,
+`Forbidden`=403, `NotFound`=404, `Conflict`=409, `Locked`=423, `Unexpected`=500) y
+`MResult<T>.Fail(message, errorType = Unexpected)` con la propiedad `ErrorType`. La tool
+`generate_api_controller_base` (y `generate_solution_layout` cuando recibe `apiProjectPath`) genera
+`Api/Controllers/ApiControllerBase.cs`, cuyo `ToActionResult(MResult<T>)` traduce `ErrorType` al
+código HTTP y devuelve siempre el `MResult` como cuerpo. `BaseService` ya usa `ErrorType.NotFound`.
+
+## Tests del scaffold
+
+```bash
+dotnet test tests/ArjuyScaffold.Tests
+```
 
 ### Tools
 
@@ -23,9 +112,12 @@ escribirlo a disco.
 | `generate_service` | `I{Entity}Service` / `{Entity}Service` en **archivos separados** (`Business/Interfaces/` y `Business/Services/`), la clase hereda `BaseService<TEntity, TResponseModel>` (verificado contra `ArjuyTurismo.Business`) e implementa solo `MapToResponse` + métodos custom — NO reimplementa `GetByIdAsync`/`GetAllAsync`/`DeleteAsync`, esos ya los da la base. Todo método (custom) devuelve `Task<MResult<T>>`, try/catch → `MResult<T>.Fail(...)` | Completo — ver sección dedicada abajo |
 | `generate_repository` | Par `I{Name}Repository` / `{Name}Repository`, ambos extienden el genérico `IBaseRepository<T>`/`BaseRepository<T>` (CRUD heredado: `GetByIdAsync`, `GetAllAsync`, `CreateAsync`, `UpdateAsync`, `DeleteAsync`, `ExistsAsync`), constructor solo reenvía el DbContext a `base(context)`, métodos custom opcionales como `Task`/`Task<T>` planos (sin `MResult<T>`, sin try/catch) | Completo |
 | `generate_ef_configuration` | `Persistence.Database/Configurations/{Entity}Configuration.cs`, `IEntityTypeConfiguration<T>` con `ToTable`, `HasKey`, `HasQueryFilter(soft delete)` (omitido si `isLookup=true`), `Property(...)` por campo y relaciones `HasMany/HasOne` + `WithOne/WithMany` + `HasForeignKey` + `OnDelete` | Completo |
-| `generate_dto` | `Business/Models/{Entity}Models.cs` con `{Entity}ResponseModel` y `{Entity}RequestModel`, propiedades planas, sin Data Annotations, strings con default `= string.Empty` | Completo |
+| `generate_dto` | UN archivo por modelo: `Business/Models/{PluralEntity}/{Entity}ResponseModel.cs` y `{Entity}RequestModel.cs`, propiedades planas, sin Data Annotations, strings con default `= string.Empty` | Completo |
 | `generate_mapper` | Código de mapeo Entity ↔ DTO para **Mapperly** o **AutoMapper**, según el parámetro **`provider` (REQUERIDO, sin default)** — ver sección dedicada abajo | Completo |
 | `generate_feature` | Tool compuesta: orquesta `generate_entity` + `generate_repository` + `generate_service` + `generate_ef_configuration` + `generate_dto` + `generate_mapper` para UNA entidad en una sola llamada, reutilizando las mismas funciones estáticas (nada duplicado) | Completo |
+| `verify_conventions` | Verifica una solución (V1–V8, ver "Herramientas de verificación") y devuelve los hallazgos | Completo |
+| `generate_conventions_check` | Emite `scripts/` (check-conventions, check-english-identifiers, verify-conventions, allowlist) | Completo |
+| `generate_api_controller_base` | `Api/Controllers/ApiControllerBase.cs` (ErrorType -> HTTP) | Completo |
 | `generate_middleware_config` | `Api/ConfigServices/{Name}Config.cs` como extension method de `IServiceCollection` (y opcionalmente de `WebApplication`) | Completo |
 | `generate_di_registration` | `DependencyInjectionConfig.cs` con `RegisterAssembly(...)` por reflexión | **Stub/incompleto** — ver abajo |
 | `generate_solution_layout` | Bibliotecas de clase REALES (`.csproj`) para Domain/Persistence.Database/Repository/Business, agregadas a un `.slnx`/`.sln` con `ProjectReference` correctos (verificado contra `arjuyTurismo/ArjuyTurismoApp`); opcionalmente wirea un proyecto Api existente | Completo — única tool que ejecuta `dotnet` CLI, ver abajo |
@@ -103,8 +195,8 @@ podría ser la opción incorrecta (con costo de licencia) para ese cliente.
 
 Ambas convenciones fueron **verificadas contra código real**, no inventadas:
 
-- **Mapperly** — verificado contra `ArjuyTurismo.Business` (memoria previa de Engram): granularidad
-  **por MÓDULO**, no por entidad — `[Mapper] public partial class {Modulo}Mapper` con métodos
+- **Mapperly** — granularidad **por ENTIDAD** (un archivo `{Entity}Mapper.cs` por entidad; ya no
+  se agrupa por módulo, el parámetro `moduleName` fue eliminado) — `[Mapper] public partial class {Entity}Mapper` con métodos
   `partial` `To{Entity}Entity(...)` / `Update{Entity}Entity(...)` / `To{Entity}ResponseModel(...)`.
   Cuando la respuesta tiene campos derivados/calculados (no es un copy 1:1), el método deja de ser
   `partial` y pasa a tener cuerpo explícito con `return new {...}` (parámetro
@@ -154,7 +246,8 @@ custom — se lo pasa a `base(...)` también, igual que `_categoryRepository` en
   resultado de la tool).
 - No registra el mapper en DI — para AutoMapper es un paso único por ensamblado (ver arriba), para
   Mapperly no aplica (no requiere DI).
-- No genera controller CRUD — queda para una próxima iteración.
+- No genera controller CRUD — queda para una próxima iteración (la base `ApiControllerBase` sí se
+  genera con `generate_api_controller_base`; los controllers la heredan y usan `ToActionResult`).
 
 ### `generate_feature` — `outputDirectoryPath` escribe PROYECTOS, no carpetas de un solo proyecto
 
@@ -165,11 +258,14 @@ custom — se lo pasa a `base(...)` también, igual que `_categoryRepository` en
 ```
 {outputDirectoryPath}/
   {namespaceRoot}.Domain/Entities/{Entity}.cs
-  {namespaceRoot}.Repository/{Entity}Repository.cs
+  {namespaceRoot}.Repository/Interfaces/I{Entity}Repository.cs
+  {namespaceRoot}.Repository/Repositories/{Entity}Repository.cs
   {namespaceRoot}.Persistence.Database/Configurations/{Entity}Configuration.cs
+  {namespaceRoot}.Business/Interfaces/I{Entity}Service.cs
   {namespaceRoot}.Business/Services/{Entity}Service.cs
-  {namespaceRoot}.Business/Models/{Entity}Models.cs
-  {namespaceRoot}.Business/Mappers/{Module}Mapper.cs        (provider=mapperly)
+  {namespaceRoot}.Business/Models/{PluralEntity}/{Entity}ResponseModel.cs
+  {namespaceRoot}.Business/Models/{PluralEntity}/{Entity}RequestModel.cs
+  {namespaceRoot}.Business/Mappers/{Entity}Mapper.cs        (provider=mapperly)
   {namespaceRoot}.Business/Mappings/{Entity}Profile.cs      (provider=automapper)
 ```
 
@@ -221,14 +317,12 @@ propio `.csproj`, que esta tool no genera). `Business` es **un solo proyecto** q
 - `generate_repository` no infiere queries reales (`Include`, `Where`, `OrderBy`, etc.) para los
   métodos custom — solo genera la firma correcta (`Task`/`Task<T>`) con un cuerpo `TODO` que
   lanza `NotImplementedException`, igual que el placeholder de `generate_service`.
-- `generate_ef_configuration` pluraliza el nombre de tabla por defecto agregando una `s` al final
-  (`Category` → `Categorys`) — naive a propósito; para nombres irregulares pasar `tableName`
-  explícito.
+- `generate_ef_configuration` pluraliza el nombre de tabla en inglés (`Pluralizer`: y→ies, s/x/z/ch/sh→es, irregulares como Person→People); para casos raros pasar `tableName`.
 - `generate_dto` sigue el patrón `{Entity}ResponseModel`/`{Entity}RequestModel` (un solo modelo de
   request) documentado para esta tarea — nótese que el proyecto real `arjuyGym` en cambio separa
   `{Entity}CreateModel`/`{Entity}UpdateModel`; si el proyecto destino usa esa variante, ajustar el
   nombre de clase generado a mano (la forma/propiedades no cambian).
-- No hay tests automatizados de las tools (solo smoke test manual vía stdio, ver abajo).
+- Tests automatizados en `tests/ArjuyScaffold.Tests` (`dotnet test tests/ArjuyScaffold.Tests`); además hay smoke test manual vía stdio (ver abajo).
 - `generate_entity` con `outputFilePath` (y `generate_feature` con `outputDirectoryPath`)
   sobrescriben el archivo sin pedir confirmación ni chequear si ya existe — comportamiento
   aceptable para un prototipo, pero a revisar antes de un uso real.

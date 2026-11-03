@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Linq;
 using System.Text;
 using ArjuyScaffold.Models;
+using ArjuyScaffold.Support;
 using ModelContextProtocol.Server;
 
 namespace ArjuyScaffold.Tools;
@@ -35,9 +36,11 @@ public static class RepositoryTool
         "try/catch, unlike generate_service — Repository methods propagate exceptions to the " +
         "Business layer) with a TODO body using _dbSet/_context, matching the real " +
         "ArjuyTurismo.Repository convention where soft delete is handled by EF Core's global " +
-        "query filter, not by manual entity.Deleted checks. Returns the generated C# source " +
-        "(interface + class in one string) — this tool does not write files to disk.")]
-    public static string GenerateRepository(
+        "query filter, not by manual entity.Deleted checks. Returns a list of {path, content} " +
+        "files — ONE FILE PER PUBLIC TYPE: Repository/Interfaces/I{Name}Repository.cs and " +
+        "Repository/Repositories/{Name}Repository.cs. Writes to disk only when 'outputDirectoryPath' " +
+        "is provided (opt-in).")]
+    public static List<GeneratedFile> GenerateRepository(
         [Description("Entity name in PascalCase, e.g. 'Category'. Generates ICategoryRepository/CategoryRepository.")] string entityName,
         [Description("Custom methods beyond the inherited CRUD (GetByIdAsync, GetAllAsync, CreateAsync, UpdateAsync, DeleteAsync, ExistsAsync). Omit or pass an empty list for a repository with no custom queries.")] List<RepositoryMethodDefinition>? customMethods = null,
         [Description("Namespace where the entity class lives, used for the using directive. Defaults to a generated namespace if omitted.")] string? entityNamespace = null,
@@ -47,7 +50,9 @@ public static class RepositoryTool
         [Description("Namespace where the DbContext class lives, used for the using directive. Defaults to a generated namespace if omitted.")] string? dbContextNamespace = null,
         [Description("DbContext type name injected into the constructor and forwarded to the base constructor. Defaults to 'AppDbContext', the arjuy* convention.")] string? dbContextTypeName = null,
         [Description("Name of the generic base repository interface. Defaults to 'IBaseRepository', the arjuy* convention.")] string? baseRepositoryInterfaceName = null,
-        [Description("Name of the generic base repository class. Defaults to 'BaseRepository', the arjuy* convention.")] string? baseRepositoryClassName = null)
+        [Description("Name of the generic base repository class. Defaults to 'BaseRepository', the arjuy* convention.")] string? baseRepositoryClassName = null,
+        [Description("Optional root namespace/project prefix (e.g. 'MyApp') used for the relative file paths of the result. Defaults to 'Generated'.")] string? namespaceRoot = null,
+        [Description("Optional absolute path to the SOLUTION root. When provided, the returned files are also written under it. Opt-in, disabled by default.")] string? outputDirectoryPath = null)
     {
         if (string.IsNullOrWhiteSpace(entityName))
         {
@@ -68,22 +73,56 @@ public static class RepositoryTool
         string interfaceName = "I" + entityName + "Repository";
         string className = entityName + "Repository";
 
+        string interfaceSource = BuildInterfaceSource(interfaceName, entityName, resolvedEntityNamespace, resolvedInterfaceNamespace, resolvedBaseNamespace, resolvedBaseRepositoryInterfaceName, resolvedMethods);
+        string classSource = BuildClassSource(className, interfaceName, entityName, resolvedEntityNamespace, resolvedImplementationNamespace, resolvedBaseNamespace, resolvedInterfaceNamespace, resolvedDbContextNamespace, resolvedBaseRepositoryClassName, resolvedDbContextTypeName, resolvedMethods);
+
+        List<GeneratedFile> files = new List<GeneratedFile>
+        {
+            new GeneratedFile(FeaturePaths.RepositoryInterface(namespaceRoot, entityName), interfaceSource),
+            new GeneratedFile(FeaturePaths.RepositoryClass(namespaceRoot, entityName), classSource),
+        };
+
+        GeneratedFileWriter.WriteAll(outputDirectoryPath, files);
+        return files;
+    }
+
+    internal static string BuildInterfaceSource(
+        string interfaceName,
+        string entityName,
+        string entityNamespace,
+        string interfaceNamespace,
+        string baseNamespace,
+        string baseRepositoryInterfaceName,
+        List<RepositoryMethodDefinition> methods)
+    {
         StringBuilder sourceBuilder = new StringBuilder();
+        AppendInterfaceUsings(sourceBuilder, entityNamespace, baseNamespace);
+        sourceBuilder.AppendLine();
+        sourceBuilder.AppendLine("namespace " + interfaceNamespace + ";");
+        sourceBuilder.AppendLine();
+        AppendInterface(sourceBuilder, interfaceName, entityName, baseRepositoryInterfaceName, methods);
+        return sourceBuilder.ToString();
+    }
 
-        AppendInterfaceUsings(sourceBuilder, resolvedEntityNamespace, resolvedBaseNamespace);
+    internal static string BuildClassSource(
+        string className,
+        string interfaceName,
+        string entityName,
+        string entityNamespace,
+        string implementationNamespace,
+        string baseNamespace,
+        string interfaceNamespace,
+        string dbContextNamespace,
+        string baseRepositoryClassName,
+        string dbContextTypeName,
+        List<RepositoryMethodDefinition> methods)
+    {
+        StringBuilder sourceBuilder = new StringBuilder();
+        AppendClassUsings(sourceBuilder, entityNamespace, dbContextNamespace, baseNamespace, interfaceNamespace);
         sourceBuilder.AppendLine();
-        sourceBuilder.AppendLine("namespace " + resolvedInterfaceNamespace + ";");
+        sourceBuilder.AppendLine("namespace " + implementationNamespace + ";");
         sourceBuilder.AppendLine();
-        AppendInterface(sourceBuilder, interfaceName, entityName, resolvedBaseRepositoryInterfaceName, resolvedMethods);
-
-        sourceBuilder.AppendLine();
-
-        AppendClassUsings(sourceBuilder, resolvedEntityNamespace, resolvedDbContextNamespace, resolvedBaseNamespace, resolvedInterfaceNamespace);
-        sourceBuilder.AppendLine();
-        sourceBuilder.AppendLine("namespace " + resolvedImplementationNamespace + ";");
-        sourceBuilder.AppendLine();
-        AppendClass(sourceBuilder, className, interfaceName, entityName, resolvedBaseRepositoryClassName, resolvedDbContextTypeName, resolvedMethods);
-
+        AppendClass(sourceBuilder, className, interfaceName, entityName, baseRepositoryClassName, dbContextTypeName, methods);
         return sourceBuilder.ToString();
     }
 
@@ -156,10 +195,10 @@ public static class RepositoryTool
         string parameterList = BuildParameterList(method.Parameters);
         string wrappedReturnType = BuildTaskReturnType(method.ReturnType);
 
-        sourceBuilder.AppendLine("    public async " + wrappedReturnType + " " + method.Name + "(" + parameterList + ")");
+        sourceBuilder.AppendLine("    public " + wrappedReturnType + " " + method.Name + "(" + parameterList + ")");
         sourceBuilder.AppendLine("    {");
-        sourceBuilder.AppendLine("        // TODO: implement " + method.Name + " query logic using _dbSet/_context.");
-        sourceBuilder.AppendLine("        // Soft-deleted rows are already excluded by the EF Core global query filter.");
+        sourceBuilder.AppendLine("        // TODO: implementar la consulta de " + method.Name + " usando _dbSet/_context.");
+        sourceBuilder.AppendLine("        // Las filas con borrado lógico ya quedan excluidas por el filtro global de EF Core.");
         sourceBuilder.AppendLine("        throw new NotImplementedException();");
         sourceBuilder.AppendLine("    }");
     }
